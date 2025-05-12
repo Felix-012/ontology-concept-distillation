@@ -6,11 +6,10 @@ from knowledge_graph.graph_utils import construct_gpu_graph, topk_indices, \
 from knowledge_graph.ner import get_mentions
 
 from rich import print as rprint
-from PIL import Image
 
 CSV_PATH = "/vol/ideadata/ce90tate/data/mimic/mimic_metadata_preprocessed.csv"
 IMAGE_BASE_PATH = "vol/ideadata/ed52egek/data/mimic/jpg/physionet.org/files/mimic-cxr-jpg/2.0.0/"
-SPLIT_VALUE = "1"
+SPLIT_VALUE = "3"
 SPLIT_COLUMN = "split"
 REPORT_COLUMN = "impression"
 ID_COLUMN = "dicom_id"
@@ -18,7 +17,7 @@ IMAGE_PATH_COLUMN = "path"
 
 MENTIONS_PATH = "/vol/ideadata/ce90tate/data/umls/mentions_mimic_p19.pkl"
 MRREL_PATH="/vol/ideadata/ce90tate/data/umls/2024AB/META/MRREL.RRF"
-K=3
+K=1
 
 data = initialize_data(CSV_PATH,
                        IMAGE_BASE_PATH,

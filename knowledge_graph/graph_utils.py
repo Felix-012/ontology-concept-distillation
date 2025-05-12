@@ -4,7 +4,7 @@ import random
 from knowledge_graph.graph import build_graph, GraphWrapper
 
 import random
-from typing import FrozenSet, Union, Optional
+from typing import FrozenSet, Union, Optional, Dict, Tuple, Iterable, List, Set
 
 import pickle
 from collections import defaultdict
@@ -27,7 +27,6 @@ def _bfs_depth(handle: ResourceHandle, sg: SGGraph, sources: cudf.Series, depth:
 
 
 
-from typing import Dict, Iterable, List, Set, Tuple
 
 def k_closest_reference_reports(
     handle: ResourceHandle,
@@ -198,3 +197,8 @@ def prepare_graph(mention_path: Union[str, os.PathLike],
                         report_list_full,
                         neg_report_list_full,
                         id_to_index)
+
+
+def get_k_nearest_image_paths_from_ids(ids: List[str], con) -> List[List[str]]:
+    pass
+
