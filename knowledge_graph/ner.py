@@ -25,6 +25,7 @@ BATCHSIZE_EMBED: int = 128
 BATCHSIZE_LINK: int = 256
 USE_GPU: bool = torch.cuda.is_available()
 DTYPE = torch.float16 if USE_GPU else torch.float32
+DEVICE=3
 
 @dataclass
 class Span:
@@ -103,6 +104,7 @@ class ClinicalEntityLinker:
             index_dir=INDEX_DIR,
             index_file=INDEX_FILE,
             dtype=DTYPE,
+            device=DEVICE
         )
 
 

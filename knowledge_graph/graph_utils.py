@@ -1,10 +1,11 @@
 import os
-import random
+from collections import defaultdict
 
+from knowledge_graph.cost_functions import dist
 from knowledge_graph.graph import build_graph, GraphWrapper
 
 import random
-from typing import FrozenSet, Union, Optional, Dict, Tuple, Iterable, List, Set
+from typing import FrozenSet, Union, Dict, Tuple, Iterable, List, Set
 
 import pickle
 from collections import defaultdict
@@ -35,10 +36,12 @@ def k_closest_reference_reports(
     vid_to_cui: Dict[int, str],
     reference_reports: Iterable[Tuple[str, Set[str]]],   # (dicom_id, CUIs)
     target_reports: Iterable[Tuple[str, Iterable[str]]], # (dicom_id, CUIs)
-    set_to_indices: Dict[FrozenSet, str],
+    set_to_ids: Dict[FrozenSet, str],
     k: int = 1,
     max_depth: int = 3,
-    allow_empty_references: bool = False
+    allow_empty_references: bool = False,
+    cost_function: str = "umls",
+    shuffle: bool  =True
 ) -> Dict[str, List[Tuple[str, Set[str], int]]]:
 
     if k <= 0:
@@ -46,22 +49,30 @@ def k_closest_reference_reports(
     if max_depth <= 0:
         raise ValueError("max_depth must be a positive integer")
 
-    frozen_refs = [
-        (ref_id, frozenset(cuis))
-        for ref_id, cuis in reference_reports
-        if allow_empty_references or cuis
-    ]
+
+    unique_refs = {}
+
+    for target_id, cuis in reference_reports:
+        if not allow_empty_references:
+            cuis = {cui for cui in cuis if len(cui) > 0}
+        unique_refs[target_id] = frozenset(cuis)
+
+
+
 
     results: Dict[str, List[Tuple[str, Set[str], int]]] = {}
 
     for target_id, target_cuis in target_reports:
+
         target = frozenset(target_cuis)
+
         if not target:
             ret = []
             for i in range(k):
-                ret.append((random.choice(set_to_indices[frozenset()]), frozenset(), 0))
+                ret.append((random.choice(set_to_ids[frozenset()]), frozenset(), 0))
             results[target_id] = ret
-            return results
+            continue
+
 
         try:
             vids = {cui_to_vid[cui] for cui in target}
@@ -81,29 +92,13 @@ def k_closest_reference_reports(
         for s in depth_sets:
             reachable |= s
 
-        valid_refs = [
-            (ref_id, ref_cuis)
-            for ref_id, ref_cuis in frozen_refs
-            if reachable.issuperset(ref_cuis)
-        ]
 
-        scored: List[Tuple[str, Set[str], int]] = []
-        for ref_id, ref_cuis in valid_refs:
-            remove = len(target - (ref_cuis & target))
+        valid_refs = [cui_set for cui_set in unique_refs[target_id] if reachable.issuperset(cui_set)]
 
-            add_per_depth = [len(ds & ref_cuis) for ds in depth_sets]
-
-            weighted_adds = sum((d + 1) * add_per_depth[d] for d in range(max_depth))
-
-            cost = (
-                remove
-                + weighted_adds
-                + abs(remove - sum(add_per_depth))
-            )
-
-            scored.append((ref_id, set(ref_cuis), cost))
-
-        scored.sort(key=lambda x: (x[2], x[0]))
+        scored = dist(target, valid_refs, depth_sets, max_depth, set_to_ids, type=cost_function)
+        if shuffle:
+            random.shuffle(scored)
+        scored.sort(key=lambda x: (x[2]))
         results[target_id] = scored[:k]
 
     return results
@@ -132,14 +127,10 @@ def construct_gpu_graph(G: cugraph.Graph, drop=None) -> tuple[SGGraph, ResourceH
 
 def topk_indices(results_by_id: dict[str, list[tuple[str, set[str], int]]],  # id -> [(neighbour_id, set, cost), ...]
                  id_to_index: Dict[str, int],  # id -> List of nearest neighbors indices
-                 k: int,
-                 shuffle: bool = False,
-                 random_generator: random.Random = random.Random(4200)) -> Dict[str, List[int]]:
+                 k: int) -> Dict[str, List[int]]:
 
     top_k_indices = {}
     for id in results_by_id.keys():
-        if shuffle:
-            random_generator.shuffle(results_by_id[id])
         total_indices = []
         for triple in results_by_id[id]:
                 total_indices.append(id_to_index[triple[0]])
@@ -164,12 +155,16 @@ def preprocess_mentions(mentions: List[List[Mention]]) \
                and (has_observation or not m.category.startswith("Anatomy"))  # ← drop anatomy if no OBS
         }
 
+        cuis_set = frozenset(cuis_set)
+
         negated_cuis_set = {
             m.cui
             for m in mentions_per_text
             if m.assertion == "absent"
 
         }
+
+        negated_cuis_set = frozenset(negated_cuis_set)
 
         report_list.append(cuis_set)
         neg_report_list.append(negated_cuis_set)
@@ -180,13 +175,19 @@ def preprocess_mentions(mentions: List[List[Mention]]) \
 
 def prepare_graph(mention_path: Union[str, os.PathLike],
                   rff_file_path: Union[str, os.PathLike],
-                  id_to_index: Optional[Dict[str, int]] = None) -> GraphWrapper:
+                  ids: List[str]) -> GraphWrapper:
 
     mentions = pickle.load(open(mention_path, "rb"))
 
     report_list, neg_report_list, set_to_indices = preprocess_mentions(mentions)
 
     keep_cuis = set().union(*report_list).union(*neg_report_list)
+
+    set_to_id = defaultdict(list)
+    for rpt, i in zip(report_list, ids):
+        set_to_id[rpt].append(i)
+
+    id_to_index = dict(zip(ids, list(range(len(ids)))))
 
     G, id_map = build_graph(rff_file_path, keep_cuis=keep_cuis)
     report_list_full = report_list.copy()
@@ -196,7 +197,8 @@ def prepare_graph(mention_path: Union[str, os.PathLike],
                         set_to_indices,
                         report_list_full,
                         neg_report_list_full,
-                        id_to_index)
+                        id_to_index,
+                        set_to_id)
 
 
 def get_k_nearest_image_paths_from_ids(ids: List[str], con) -> List[List[str]]:

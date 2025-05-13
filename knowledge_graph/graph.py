@@ -111,12 +111,14 @@ class GraphWrapper:
                  set_to_indices,
                  report_list,
                  neg_report_list,
-                 id_to_index):
+                 id_to_index,
+                 set_to_id):
 
         self.graph = graph
         self.id_map = id_map
         self.report_list = report_list
         self.neg_report_list = neg_report_list
+        self.set_to_id = set_to_id
         self.set_to_indices = set_to_indices
         self.id_to_index = id_to_index
         self.cui_to_vid = dict(zip(id_map["CUI"].values_host, id_map["vid"].values_host))

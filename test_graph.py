@@ -17,7 +17,7 @@ IMAGE_PATH_COLUMN = "path"
 
 MENTIONS_PATH = "/vol/ideadata/ce90tate/data/umls/mentions_mimic_p19.pkl"
 MRREL_PATH="/vol/ideadata/ce90tate/data/umls/2024AB/META/MRREL.RRF"
-K=1
+K=10
 
 data = initialize_data(CSV_PATH,
                        IMAGE_BASE_PATH,
@@ -30,37 +30,47 @@ impressions = data["reports"]
 
 mentions = get_mentions(MENTIONS_PATH, impressions)
 
-id_to_index = dict(zip(data["ids"], list(range(len(data["ids"])))))
+wrapper = prepare_graph(MENTIONS_PATH, MRREL_PATH, data["ids"])
 
-wrapper = prepare_graph(MENTIONS_PATH, MRREL_PATH, id_to_index)
-
-i= random.randint(0, len(mentions) - 1)
+target_indices = random.sample(range(0, len(mentions)), 5)
 
 report_list = wrapper.report_list.copy()
 neg_report_list = wrapper.neg_report_list.copy()
 
-target_idx = i
-target = report_list.pop(target_idx)
+mapped_reports = []
+mapped_targets = []
+
+for idx in target_indices:
+    rep_curr = report_list.copy()
+    target_curr = rep_curr.pop(idx)
+    mapped_reports.append((data["ids"][idx], rep_curr))
+    mapped_targets.append((data["ids"][idx], target_curr))
 
 sg, handle = construct_gpu_graph(wrapper.graph)
+for cost_function in ["umls", "jac"]:
+    results = k_closest_reference_reports(handle,
+                                          sg,
+                                          wrapper.cui_to_vid,
+                                          wrapper.vid_to_cui,
+                                          mapped_reports,
+                                          mapped_targets,
+                                          wrapper.set_to_id,
+                                          k=K,
+                                          cost_function=cost_function,
+                                          max_depth=4)
+    indices = topk_indices(results, wrapper.id_to_index, k=K)
+    for i, target_idx in enumerate(target_indices):
+        print("Target idx:", target_idx)
+        rprint(f"[bold green]Target impression: {impressions[target_idx]}[/bold green]")
+        print("Target CUIs:", ", ".join(sorted(mapped_targets[i][1])))
 
-results = k_closest_reference_reports(handle,
-                                      sg,
-                                      wrapper.cui_to_vid,
-                                      wrapper.vid_to_cui,
-                                      zip(data["ids"], report_list),
-                                      [(data["ids"][i], target)],
-                                      wrapper.set_to_indices,
-                                      k=K)
-indices = topk_indices(results, wrapper.id_to_index, k=K, shuffle=True)
 
-print("Target idx:", target_idx)
-rprint(f"[bold green]Target impression: {impressions[target_idx]}[/bold green]")
-print("Target CUIs:", ", ".join(sorted(target)))
+        for index in indices[data["ids"][target_idx]]:
+            rprint(f"[bold cyan]{impressions[index]}[/bold cyan]")
+            print("Reference CUIs:", ", ".join(sorted(report_list[index])))
+            #rprint(f"[bold dark_cyan]{data['image_paths'][index]}[/bold dark_cyan]")
+            print("")
 
-for id in indices.keys():
-    rprint(f"[bold deep_pink4]closest reference reports and images for {id}:[/bold deep_pink4]")
-    for index in indices[id]:
-        rprint(f"[bold cyan]{impressions[index]}[/bold cyan]")
-        rprint(f"[bold dark_cyan]{data['image_paths'][index]}[/bold dark_cyan]")
+
+
 
