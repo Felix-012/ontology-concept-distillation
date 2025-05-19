@@ -15,7 +15,7 @@ from radgraph import RadGraph
 
 # constants for from_default_constants()
 SAPBERT_MODEL_ID: str = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
-INDEX_DIR: Path = Path("/vol/ideadata/ce90tate/conditioning_mixture/knowledge_graph/sapbert_umls_index")
+INDEX_DIR: Path = Path("/vol/ideadata/ce90tate/data/faiss/sapbert_umls_index")
 INDEX_FILE: Path = INDEX_DIR / "sapbert.index"
 MAPPING_FILE: Path = INDEX_DIR / "sapbert_id2cui.json"
 RRF_FILE: Path = Path("/vol/ideadata/ce90tate/data/umls/2024AB/META/MRCONSO.RRF")

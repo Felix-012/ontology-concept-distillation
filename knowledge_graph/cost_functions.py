@@ -1,6 +1,9 @@
 from typing import List, Set, Dict, Tuple, Union
 import math
 
+from knowledge_graph.ic_metrics import resnik_bma, _mean_ic
+
+
 def dist(
     target: Set[str],
     valid_refs: List[Set[str]],
@@ -99,3 +102,33 @@ def depth_weighted_distance(
         for ref_id in set_to_ids[ref_cuis]:
             scored.append((ref_id, ref_cuis, cost))
     return scored
+
+
+
+def ic_dist(target, valid_refs, set_to_ids, ic_graph_wrapper, type="lin"):
+    target = ic_graph_wrapper.translate(target)
+    valid_refs = ic_graph_wrapper.translate(valid_refs)
+    if type == "lin":
+        return lin(target, valid_refs, set_to_ids, ic_graph_wrapper)
+    else:
+        raise NotImplementedError(f"{type} is not implemented")
+
+def lin(target, valid_refs, set_to_ids, ic_graph_wrapper):
+    scored = []
+    for ref_cuis in valid_refs:
+        if len(ref_cuis) == 0 and len(target) == 0:
+            cost = 0
+        elif len(ref_cuis) == 0 or len(target) == 0:
+            cost = 1
+        else:
+            numerator = 2 * resnik_bma(ic_graph_wrapper.graph, ic_graph_wrapper.handle, target, ref_cuis, ic_graph_wrapper.ic_scores)
+            target_ic = _mean_ic(target, ic_graph_wrapper.ic_scores)
+            ref_ic = _mean_ic(ref_cuis, ic_graph_wrapper.ic_scores)
+            denominator = target_ic + ref_ic
+            sim = 0 if denominator == 0 else numerator / denominator
+            cost = 1 - sim
+
+        for ref_id in set_to_ids[frozenset(ic_graph_wrapper.translate_back(ref_cuis))]:
+            scored.append((ref_id, ref_cuis, cost))
+    return scored
+

@@ -1,7 +1,6 @@
 import os
-from collections import defaultdict
 
-from knowledge_graph.cost_functions import dist
+from knowledge_graph.cost_functions import dist, ic_dist
 from knowledge_graph.graph import build_graph, GraphWrapper
 
 import random
@@ -14,7 +13,8 @@ import cupy
 from pylibcugraph import bfs, ResourceHandle, SGGraph, GraphProperties
 import cupy as cp
 
-from knowledge_graph.ner import Mention
+from knowledge_graph.ic_metrics import ICGraphWrapper
+from knowledge_graph.ner import Mention, get_mentions
 
 
 def _bfs_depth(handle: ResourceHandle, sg: SGGraph, sources: cudf.Series, depth: int = 2):
@@ -41,7 +41,8 @@ def k_closest_reference_reports(
     max_depth: int = 3,
     allow_empty_references: bool = False,
     cost_function: str = "umls",
-    shuffle: bool  =True
+    shuffle: bool  =True,
+    ic_graph_wrapper: ICGraphWrapper = None,
 ) -> Dict[str, List[Tuple[str, Set[str], int]]]:
 
     if k <= 0:
@@ -94,8 +95,10 @@ def k_closest_reference_reports(
 
 
         valid_refs = [cui_set for cui_set in unique_refs[target_id] if reachable.issuperset(cui_set)]
-
-        scored = dist(target, valid_refs, depth_sets, max_depth, set_to_ids, type=cost_function)
+        if ic_graph_wrapper is None:
+            scored = dist(target, valid_refs, depth_sets, max_depth, set_to_ids, type=cost_function)
+        else:
+            scored = ic_dist(target, valid_refs, set_to_ids, ic_graph_wrapper, type=cost_function)
         if shuffle:
             random.shuffle(scored)
         scored.sort(key=lambda x: (x[2]))
@@ -109,7 +112,7 @@ def construct_gpu_graph(G: cugraph.Graph, drop=None) -> tuple[SGGraph, ResourceH
     G_sym = G.to_directed()
     srcs = G_sym.edgelist.edgelist_df['src']
     dsts = G_sym.edgelist.edgelist_df['dst']
-    if drop:
+    if drop is not None:
         keep_mask = (~cp.isin(cp.asarray(srcs), cp.asarray(drop)) & (~cp.isin(cp.asarray(dsts), cp.asarray(drop))))
         srcs = srcs[keep_mask]
         dsts = dsts[keep_mask]
@@ -174,10 +177,12 @@ def preprocess_mentions(mentions: List[List[Mention]]) \
 
 
 def prepare_graph(mention_path: Union[str, os.PathLike],
+                  impressions,
                   rff_file_path: Union[str, os.PathLike],
                   ids: List[str]) -> GraphWrapper:
 
-    mentions = pickle.load(open(mention_path, "rb"))
+
+    mentions = get_mentions(mention_path, impressions)
 
     report_list, neg_report_list, set_to_indices = preprocess_mentions(mentions)
 
@@ -201,6 +206,24 @@ def prepare_graph(mention_path: Union[str, os.PathLike],
                         set_to_id)
 
 
-def get_k_nearest_image_paths_from_ids(ids: List[str], con) -> List[List[str]]:
+def bfs_trim_subgraph(handle: ResourceHandle,
+                      sg: SGGraph,
+                      seed_cuis: Iterable,
+                      max_depth: int,
+                      *,
+                      edges) -> cudf.DataFrame:
+    seeds = cudf.Series(cp.asarray(list(seed_cuis), dtype=cp.int32), name="sources")
+    bfs_df = bfs(handle, sg, seeds, False, max_depth, False, False)
+    distances = bfs_df[0]
+    mask = distances < cp.iinfo(distances.dtype).max
+    reached = cp.flatnonzero(mask)
+
+    mask = edges["src"].isin(reached) | edges["dst"].isin(reached)
+    sub_edges = edges[mask]
+
+    return sub_edges
+
+
+def get_k_nearest_image_paths_from_report(report: str, k: int) -> List[List[str]]:
     pass
 
