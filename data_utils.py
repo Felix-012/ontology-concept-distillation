@@ -20,8 +20,7 @@ CLASSES = [
 ]
 
 
-def initialize_data(csv_path: Union[str, os.PathLike],
-                    image_base_path: Union[str, os.PathLike],
+def initialize_data(image_base_path: Union[str, os.PathLike],
                     report_column:  Union[str, int],
                     id_column: Union[str, int],
                     image_path_column: Union[str, int],

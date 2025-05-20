@@ -4,7 +4,7 @@ from knowledge_graph.cost_functions import dist, ic_dist
 from knowledge_graph.graph import build_graph, GraphWrapper
 
 import random
-from typing import FrozenSet, Union, Dict, Tuple, Iterable, List, Set
+from typing import FrozenSet, Union, Dict, Tuple, Iterable, List, Set, Optional
 
 import pickle
 from collections import defaultdict
@@ -179,7 +179,9 @@ def preprocess_mentions(mentions: List[List[Mention]]) \
 def prepare_graph(mention_path: Union[str, os.PathLike],
                   impressions,
                   rff_file_path: Union[str, os.PathLike],
-                  ids: List[str]) -> GraphWrapper:
+                  ids: List[str],
+                  *,
+                  additional_cuis: Optional[Set] = None) -> GraphWrapper:
 
 
     mentions = get_mentions(mention_path, impressions)
@@ -187,6 +189,8 @@ def prepare_graph(mention_path: Union[str, os.PathLike],
     report_list, neg_report_list, set_to_indices = preprocess_mentions(mentions)
 
     keep_cuis = set().union(*report_list).union(*neg_report_list)
+    if additional_cuis is not None:
+        keep_cuis = keep_cuis | set(additional_cuis)
 
     set_to_id = defaultdict(list)
     for rpt, i in zip(report_list, ids):
@@ -195,13 +199,12 @@ def prepare_graph(mention_path: Union[str, os.PathLike],
     id_to_index = dict(zip(ids, list(range(len(ids)))))
 
     G, id_map = build_graph(rff_file_path, keep_cuis=keep_cuis)
-    report_list_full = report_list.copy()
-    neg_report_list_full = neg_report_list.copy()
+
     return GraphWrapper(G,
                         id_map,
                         set_to_indices,
-                        report_list_full,
-                        neg_report_list_full,
+                        report_list,
+                        neg_report_list,
                         id_to_index,
                         set_to_id)
 

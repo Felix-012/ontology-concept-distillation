@@ -3,24 +3,20 @@ anomalies:
   - Cardiomegaly
   - Consolidation
   - Edema
-  - Enlarged Cardiomediastinum
-  - Fracture
-  - Lung Lesion
-  - Lung Opacity
   - No Finding
   - Pleural Effusion
   - Pneumonia
   - Pneumothorax
 
-mentions_path: "/vol/ideadata/ce90tate/data/umls/mentions_mimic_lt_balanced_train.pkl"
-retrieval_mentions_path: "/vol/ideadata/ce90tate/data/umls/mentions_mimic_lt_retrieve.pkl"
+mentions_path: "/vol/ideadata/ce90tate/data/umls/mentions_mimic_lt_Consolidation_train.pkl"
+retrieval_mentions_path: "/vol/ideadata/ce90tate/data/umls/mentions_8_balanced_retrieve.pkl"
 mrrel_path: "/vol/ideadata/ce90tate/data/umls/2024AB/META/MRREL.RRF"
 
 init_data_args:
   image_base_path: "vol/ideadata/ed52egek/data/mimic/jpg/physionet.org/files/mimic-cxr-jpg/2.0.0/"
   report_column: "impression"
   id_column: "dicom_id"
-  image_path_column: "path"
+  image_path_column: path
 
 retrieval_args:
   use_ic: False
@@ -29,10 +25,10 @@ retrieval_args:
 hyperparameters:
   k: 1
   max_expl_depth: 5
-  batch_size: 32
+  batch_size: 1
+  max_length: 256
 
-
-
-
-
+cosine_similarity:
+  model: emilyalsentzer/Bio_ClinicalBERT
+  index_path: /vol/ideadata/ce90tate/data/faiss/ss/bio_clinical_bert.index
 

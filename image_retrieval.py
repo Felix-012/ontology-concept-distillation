@@ -21,7 +21,6 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
     with open(config_path) as stream:
         config = yaml.safe_load(stream)
 
-    id_column = config["init_data_args"]["id_column"]
     report_column = config["init_data_args"]["report_column"]
     image_path_column = config["init_data_args"]["image_path_column"]
     batch_size = config["hyperparameters"]["batch_size"]
@@ -29,14 +28,26 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
     anomalies = config["anomalies"]
 
     retrieval_data = initialize_data(**config["init_data_args"], df=df_retrieval)
-    wrapper = prepare_graph(config["retrieval_mentions_path"], retrieval_data["reports"], config["mrrel_path"], retrieval_data["ids"])
-    unbalanced_reports, _, _ = preprocess_mentions(get_mentions(config["mentions_path"], df_unbalanced[report_column]))
+    unbalanced_data = initialize_data(**config["init_data_args"], df=df_unbalanced)
+    unbalanced_reports, neg_unbalanced_reports, _ = preprocess_mentions(
+        get_mentions(config["mentions_path"], df_unbalanced[report_column]))
+    additional_cuis =  set().union(*unbalanced_reports).union(*neg_unbalanced_reports)
+    wrapper = prepare_graph(config["retrieval_mentions_path"],
+                            retrieval_data["reports"],
+                            config["mrrel_path"],
+                            retrieval_data["ids"],
+                            additional_cuis=additional_cuis)
 
     retrieval_reports = wrapper.report_list.copy()
-    keep_cuis = set().union(*wrapper.report_list).union(*wrapper.neg_report_list)
+
 
     ic_graph_wrapper = None
     if config["retrieval_args"]["use_ic"]:
+        keep_cuis = (set()
+                     .union(*wrapper.report_list)
+                     .union(*wrapper.neg_report_list)
+                     .union(unbalanced_reports)
+                     .union(neg_unbalanced_reports))
         ic_graph_wrapper = construct_ic_graph_wrapper(config["mrrel_path"],
                                                       keep_cuis,
                                                       config["hyperparameters"]["max_expl_depth"])
@@ -49,17 +60,19 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
     add_data = {}
     for anomaly in anomalies:
         add_data[anomaly] = []
-        df_anomaly = df_unbalanced[df_unbalanced[anomaly]]
+        df_anomaly = df_unbalanced[df_unbalanced[anomaly].fillna(False)]
         data = initialize_data(**config["init_data_args"], df=df_anomaly)
         n_to_retrieve = n_max - len(df_anomaly)
+        batch_size = min(batch_size, len(data["reports"]))
         for start in range(0, n_to_retrieve, batch_size):
-            target_indices = [(start + k) % len(data) for k in range(batch_size)]
+            target_indices_anomaly = [(start + k) % len(data["reports"]) for k in range(batch_size)]
+            target_indices = list(df_anomaly.iloc[target_indices_anomaly].index)
             mapped_reports = []
             mapped_targets = []
             for idx in target_indices:
                 target_curr = unbalanced_reports[idx]
-                mapped_reports.append((data["ids"][idx], retrieval_reports))
-                mapped_targets.append((data["ids"][idx], target_curr))
+                mapped_reports.append((unbalanced_data["ids"][idx], retrieval_reports))
+                mapped_targets.append((unbalanced_data["ids"][idx], target_curr))
 
             sg, handle = construct_gpu_graph(wrapper.graph)
 
@@ -80,19 +93,22 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
 
             mapped_indices = topk_indices(results, wrapper.id_to_index, k=config["hyperparameters"]["k"])
             for target_idx in target_indices:
-                indices = mapped_indices[["ids"][target_idx]]
-                add_data[anomaly].append(df_retrieval[id_column,report_column, image_path_column].iloc[indices])
+                indices = mapped_indices[unbalanced_data["ids"][target_idx]]
+                add_data[anomaly].append(df_retrieval[image_path_column].iloc[indices])
+                indices = set(indices)
+                retrieval_reports = [report for i, report in enumerate(retrieval_reports) if i not in indices]
 
-        for index in add_data[anomaly]:
-            df_unbalanced.loc[-1, ['path', 'Finding Labels']] = [data["image_paths"][index], anomaly]
+        for image_path in add_data[anomaly]:
+            df_unbalanced.loc[len(df_unbalanced), ['path', 'Finding Labels']] = [image_path.values[0], anomaly]
+        df_unbalanced.to_csv("/vol/ideadata/ce90tate/knowledge_graph_distance/retrieved/metric=umls_consolidation_10.csv")
 
     return df_unbalanced
 
 
 
 if __name__ == "__main__":
-    fill_low_tail_classes("/vol/ideadata/ce90tate/knowledge_graph_distance/splits/longtail_balanced_train.csv",
-                          "/vol/ideadata/ce90tate/knowledge_graph_distance/splits/longtail_balanced_retrieve.csv",
+    df_filled = fill_low_tail_classes("/vol/ideadata/ce90tate/knowledge_graph_distance/splits/longtail_8_train_unbalanced_Consolidation.csv",
+                          "/vol/ideadata/ce90tate/knowledge_graph_distance/splits/longtail_8_balanced_retrieve.csv",
                           "/vol/ideadata/ce90tate/knowledge_graph_distance/config.yml")
 
 
