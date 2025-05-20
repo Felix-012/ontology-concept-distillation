@@ -2,10 +2,20 @@ import os
 import argparse
 import time
 import numpy as np
-from downstream.chexnet_trainer import ChexnetTrainer
+import random
 import torch
+from downstream.chexnet_trainer import ChexnetTrainer
 
 # --------------------------------------------------------------------------------
+
+def set_seed(seed):
+    """Set all random seeds for reproducibility"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def main():
     parser = argparse.ArgumentParser(description="ChexNet Training and Testing CLI")
@@ -29,6 +39,7 @@ def main():
     train_parser.add_argument("--crop", type=int, default=224, help="Crop image dimension")
     train_parser.add_argument("--save_path", default="models", help="Path to save the trained model")
     train_parser.add_argument("--debug", action="store_true", help="Debug mode: overfit on 4 batches of training data")
+    train_parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
 
     # Test parser
     test_parser = subparsers.add_parser("test", help="Test the model")
@@ -42,8 +53,12 @@ def main():
     test_parser.add_argument("--batch_size", type=int, default=16, help="Batch size for testing")
     test_parser.add_argument("--resize", type=int, default=256, help="Resize image dimension")
     test_parser.add_argument("--crop", type=int, default=224, help="Crop image dimension")
+    test_parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
 
     args = parser.parse_args()
+
+    # Set the random seed
+    set_seed(args.seed)
 
     if args.mode == "train":
         runTrain(args)
@@ -59,7 +74,8 @@ def runTrain(args):
     timestampDate = time.strftime("%d%m%Y")
     timestampLaunch = f"{timestampDate}-{timestampTime}"
 
-    model_save_path = os.path.join(args.save_path, f"m-{timestampLaunch}.pth.tar")
+    # Include seed in model save path
+    model_save_path = os.path.join(args.save_path, f"m-{timestampLaunch}-seed{args.seed}.pth.tar")
     os.makedirs(args.save_path, exist_ok=True)
 
     if args.data_dir_train is not None: 
@@ -68,6 +84,7 @@ def runTrain(args):
         args.data_dir_train = args.data_dir
 
     print(f"Training NN architecture = {args.arch}")
+    print(f"Using random seed = {args.seed}")
 
     ChexnetTrainer.train(
         args.data_dir,
