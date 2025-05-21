@@ -45,7 +45,6 @@ neg_report_list = wrapper.neg_report_list.copy()
 
 keep_cuis = set().union(*report_list).union(*neg_report_list)
 
-
 ic_graph_wrapper = construct_ic_graph_wrapper(MRREL_PATH, keep_cuis, MAX_EXPL_DEPTH)
 
 mapped_reports = []

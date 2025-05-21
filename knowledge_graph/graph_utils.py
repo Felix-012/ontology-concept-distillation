@@ -41,8 +41,10 @@ def k_closest_reference_reports(
     max_depth: int = 3,
     allow_empty_references: bool = False,
     cost_function: str = "umls",
-    shuffle: bool  =True,
     ic_graph_wrapper: ICGraphWrapper = None,
+    neg_reference_reports: List[Tuple[str, Set[str]]] = None,
+    neg_target = None,
+    ids_to_index = None,
 ) -> Dict[str, List[Tuple[str, Set[str], int]]]:
 
     if k <= 0:
@@ -52,56 +54,90 @@ def k_closest_reference_reports(
 
 
     unique_refs = {}
+    unique_neg_refs = {}
 
     for target_id, cuis in reference_reports:
         if not allow_empty_references:
             cuis = {cui for cui in cuis if len(cui) > 0}
         unique_refs[target_id] = frozenset(cuis)
-
-
+        unique_neg_refs[target_id] = frozenset(cuis)
 
 
     results: Dict[str, List[Tuple[str, Set[str], int]]] = {}
 
-    for target_id, target_cuis in target_reports:
+    for (target_id, target_cuis), (neg_target_id, neg_target_cuis) in zip(target_reports, neg_target):
 
         target = frozenset(target_cuis)
+        neg_target = frozenset(neg_target_cuis)
 
-        if not target:
+        if not target and not neg_target:
             ret = []
             for i in range(k):
                 ret.append((random.choice(set_to_ids[frozenset()]), frozenset(), 0))
             results[target_id] = ret
             continue
 
-
         try:
             vids = {cui_to_vid[cui] for cui in target}
+            neg_vids = {cui_to_vid[cui] for cui in neg_target}
         except KeyError as e:
             raise ValueError(f"CUI {e.args[0]!r} from target_report not in id_map")
 
-        distances, vertices = _bfs_depth(handle, sg, cudf.Series(list(vids)), depth=max_depth)
+        if vids:
+            distances, vertices = _bfs_depth(handle, sg, cudf.Series(list(vids)), depth=max_depth)
+            depth_sets: List[Set[str]] = []
+            for d in range(1, max_depth + 1):
+                vids_at_d = cupy.asnumpy(vertices[distances == d])
+                depth_sets.append({vid_to_cui[v] for v in vids_at_d})
+
+        if neg_vids:
+            distances, vertices = _bfs_depth(handle, sg, cudf.Series(list(neg_vids)), depth=max_depth)
+            neg_depth_sets: List[Set[str]] = []
+            for d in range(1, max_depth + 1):
+                vids_at_d = cupy.asnumpy(vertices[distances == d])
+                neg_depth_sets.append({vid_to_cui[v] for v in vids_at_d})
 
 
-        depth_sets: List[Set[str]] = []
-        for d in range(1, max_depth + 1):
-            vids_at_d = cupy.asnumpy(vertices[distances == d])
-            depth_sets.append({vid_to_cui[v] for v in vids_at_d})
+        if not target:
+            ret = []
+            candidates = set_to_ids[frozenset()]
+            cand_indices = ids_to_index[candidates]
+            neg_candidates = [neg_reference_reports[cand_index][1] for cand_index in cand_indices]
+            scores_neg = dist(neg_target, neg_candidates, neg_depth_sets, max_depth, set_to_ids, type=cost_function)
+            cand_with_scores = list(zip(neg_candidates, scores_neg))
+            cand_with_scores.sort(key=lambda pair: pair[1])
+            sorted_neg_candidates, sorted_scores_neg = zip(*cand_with_scores)
+            for i in range(k):
+                ret.append((sorted_neg_candidates[i], frozenset(), 0))
+            results[target_id] = ret
+            continue
 
 
         reachable: Set[str] = set(target)
         for s in depth_sets:
             reachable |= s
 
-
-        valid_refs = [cui_set for cui_set in unique_refs[target_id] if reachable.issuperset(cui_set)]
+        refs = unique_refs[target_id]
+        neg_refs = unique_neg_refs[target_id]
+        valid_pairs = [
+            (r, n)
+            for r, n in zip(refs, neg_refs)
+            if reachable.issuperset(r)
+        ]
+        valid_refs, valid_neg_refs = map(list, zip(*valid_pairs))
         if ic_graph_wrapper is None:
             scored = dist(target, valid_refs, depth_sets, max_depth, set_to_ids, type=cost_function)
+            if neg_target:
+                scored_neg = dist(neg_target, valid_neg_refs, neg_depth_sets, max_depth, set_to_ids, type=cost_function)
+                paired = list(zip(scored, scored_neg))
+                paired.sort(key=lambda pair: (pair[0][2], pair[1][2]))
+                scored, _ = zip(*paired)
+            else:
+                scored.sort(key=lambda x: (x[2]))
         else:
             scored = ic_dist(target, valid_refs, set_to_ids, ic_graph_wrapper, type=cost_function)
-        if shuffle:
-            random.shuffle(scored)
-        scored.sort(key=lambda x: (x[2]))
+            scored.sort(key=lambda x: (x[2]))
+
         results[target_id] = scored[:k]
 
     return results
