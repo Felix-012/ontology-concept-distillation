@@ -63,9 +63,10 @@ def embed_texts(
 
 
 def build_index(embeddings: np.ndarray) -> faiss.Index:
+    ids = np.arange(embeddings.shape[0])
     d = embeddings.shape[1]
-    idx = faiss.IndexFlatIP(d)
-    idx.add(embeddings)
+    idx = faiss.IndexIDMap2(faiss.IndexFlatIP(d))
+    idx.add_with_ids(embeddings, ids)
     return idx
 
 
@@ -77,7 +78,7 @@ def load_index(path: pathlib.Path) -> faiss.Index:
     return faiss.read_index(str(path))
 
 
-def knn(index: faiss.Index, query: np.ndarray, corpus: List[str], ids: List[str], k: int):
+def knn(index: faiss.Index, query: np.ndarray, k: int):
     scores, idx = index.search(query, k)
     return scores, idx
 

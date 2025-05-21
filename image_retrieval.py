@@ -1,6 +1,9 @@
 from pathlib import Path
 from typing import Dict, Tuple, Union
 import random
+
+import faiss
+import numpy as np
 import pandas as pd
 import yaml
 from transformers import AutoTokenizer, AutoModel
@@ -32,8 +35,22 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
 
     retrieval_data = initialize_data(**config["init_data_args"], df=df_retrieval)
     unbalanced_data = initialize_data(**config["init_data_args"], df=df_unbalanced)
-    if config["retrieval_args"]["cost_function"] == "cosine similarity":
-        pass
+    if config["retrieval_args"]["cost_function"] == "cosine_similarity":
+        tokenizer = AutoTokenizer.from_pretrained(config["cosine_similarity"]["model"])
+        model = AutoModel.from_pretrained(config["cosine_similarity"]["model"])
+        if Path(config["cosine_similarity"]["index_path"]).exists():
+            index = load_index(config["cosine_similarity"]["index_path"])
+        else:
+            corpus_vecs = embed_texts(
+                retrieval_data["reports"],
+                tokenizer,
+                model,
+                config["hyperparameters"]["max_length"],
+                batch_size,
+                "cuda",
+            )
+            index = build_index(corpus_vecs)
+            save_index(index, config["cosine_similarity"]["index_path"])
     else:
         unbalanced_reports, neg_unbalanced_reports, _ = preprocess_mentions(
             get_mentions(config["mentions_path"], df_unbalanced[report_column]))
@@ -75,28 +92,18 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
             target_indices_anomaly = [(start + k) % len(data["reports"]) for k in range(batch_size)]
             target_indices = list(df_anomaly.iloc[target_indices_anomaly].index)
             if config["retrieval_args"]["cost_function"] == "cosine_similarity":
-                tokenizer = AutoTokenizer.from_pretrained(config["cosine_similarity"]["model"])
-                model = AutoModel.from_pretrained(config["cosine_similarity"]["model"])
-
-                if Path(config["cosine_similarity"]["index_path"]).exists():
-                    index = load_index(config["cosine_similarity"]["index_path"])
-                else:
-                    corpus_vecs = embed_texts(
-                        data["reports"],
-                        tokenizer,
-                        model,
-                        config["hyperparameters"]["max_length"],
-                        batch_size,
-                        "cuda",
-                    )
-                    index = build_index(corpus_vecs)
-                    save_index(index, config["cosine_similarity"]["index_path"])
                 query_vec = embed_texts([data["reports"][i] for i in target_indices_anomaly],
                                         tokenizer,
                                         model,
                                         config["hyperparameters"]["max_length"],
                                         batch_size, "cuda")
-                scores, indices = knn(index, query_vec, data["reports"], data["ids"], config["hyperparameters"]["k"])
+                scores, indices = knn(index, query_vec, config["hyperparameters"]["k"])
+                indices = [index for inner_indices in indices for index in inner_indices]
+                indices = np.asarray(indices)
+                index.remove_ids(indices)
+
+                add_data[anomaly].append(df_retrieval[image_path_column].iloc[indices])
+                reports.append((indices[0], df_retrieval[report_column].iloc[indices].values[0]))
             else:
                 mapped_reports = []
                 mapped_neg_reports = []
@@ -146,7 +153,7 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
 
         for image_path in add_data[anomaly]:
             df_unbalanced.loc[len(df_unbalanced), ['path', 'Finding Labels']] = [image_path.values[0], anomaly]
-        df_unbalanced.to_csv("/vol/ideadata/ce90tate/knowledge_graph_distance/retrieved/metric=umls_consolidation_10.csv")
+        df_unbalanced.to_csv("/vol/ideadata/ce90tate/knowledge_graph_distance/retrieved/metric=cosine_similarity_consolidation_10.csv")
 
     return df_unbalanced
 
