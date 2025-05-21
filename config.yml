@@ -24,7 +24,8 @@ retrieval_args:
 
 hyperparameters:
   k: 1
-  max_expl_depth: 5
+  max_expl_depth: 100
+
   batch_size: 1
   max_length: 256
 

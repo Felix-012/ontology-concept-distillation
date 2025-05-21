@@ -23,6 +23,7 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
     with open(config_path) as stream:
         config = yaml.safe_load(stream)
 
+    id_column = config["init_data_args"]["id_column"]
     report_column = config["init_data_args"]["report_column"]
     image_path_column = config["init_data_args"]["image_path_column"]
     batch_size = config["hyperparameters"]["batch_size"]
@@ -111,7 +112,6 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
 
                 sg, handle = construct_gpu_graph(wrapper.graph)
 
-
                 results = k_closest_reference_reports(
                     handle,
                     sg,
@@ -126,7 +126,8 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
                     ic_graph_wrapper=ic_graph_wrapper,
                     ids_to_index=wrapper.id_to_index,
                     neg_target=mapped_neg_targets,
-                    neg_reference_reports=mapped_neg_reports
+                    neg_reference_reports=mapped_neg_reports,
+                    neg_set_to_ids = wrapper.neg_set_to_id
                 )
 
 
@@ -135,12 +136,13 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
                     indices = mapped_indices[unbalanced_data["ids"][target_idx]]
                     add_data[anomaly].append(df_retrieval[image_path_column].iloc[indices])
                     reports.append((indices[0], df_retrieval[report_column].iloc[indices].values[0]))
-                    indices = set(indices)
-                    retrieval_reports = [report for i, report in enumerate(retrieval_reports) if i not in indices]
-                    for result in results[unbalanced_data["ids"][target_idx]]:
-                        wrapper.set_to_id[result[1]].pop()
-                        if len(wrapper.set_to_id[result[1]]) == 0:
-                            del wrapper.set_to_id[result[1]]
+                    used_ids = {df_retrieval.iloc[i][id_column] for i in indices}
+                    retrieval_reports = [report for report in retrieval_reports if len(set(wrapper.set_to_id
+                    [report]) & used_ids) == 0]
+                    #for result in results[unbalanced_data["ids"][target_idx]]:
+                    #    wrapper.set_to_id[result[1]].pop()
+                    #    if len(wrapper.set_to_id[result[1]]) == 0:
+                    #        del wrapper.set_to_id[result[1]]
 
         for image_path in add_data[anomaly]:
             df_unbalanced.loc[len(df_unbalanced), ['path', 'Finding Labels']] = [image_path.values[0], anomaly]
