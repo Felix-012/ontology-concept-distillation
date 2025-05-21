@@ -125,6 +125,11 @@ class ClinicalEntityLinker:
         for ent in entities.values():
             label = ent["label"]
             mention_text = ent["tokens"]
+            relations = ent["relations"]
+            if label.endswith("definitely absent"):
+                for relation in relations:
+                    entities[relation[1]]["label"] = entities[relation[1]]["label"].replace("definitely present", "definitely absent")
+
 
             # Approximate char indices (token‑level indices available in ent)
             char_start = note.lower().find(mention_text.lower())

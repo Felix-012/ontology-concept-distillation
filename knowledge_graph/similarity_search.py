@@ -79,8 +79,7 @@ def load_index(path: pathlib.Path) -> faiss.Index:
 
 def knn(index: faiss.Index, query: np.ndarray, corpus: List[str], ids: List[str], k: int):
     scores, idx = index.search(query, k)
-    return [(ids[i], float(s), corpus[i]) for i, s in zip(idx[0], scores[0])]
-
+    return scores, idx
 
 def main():
     args = parse_args()

@@ -9,16 +9,26 @@ from pylibcugraph import SGGraph
 def build_graph(mrrel_path: Union[str, os.PathLike],
                 keep_cuis: Optional[set[str]] = None,
                 require_both: bool = True):
+    wanted_rels = ["SY", "PAR", "CHD", "RB", "RN", "RQ", "RL"]
 
     rel = cudf.read_csv(
         mrrel_path,
-        sep="|", header=None,
-        usecols=[0, 4],
-        names=["CUI1", "CUI2"],
+        sep="|",
+        header=None,
+        usecols=[0, 3, 4],  # 0=CUI1, 3=REL, 4=CUI2
+        names=["CUI1", "REL", "CUI2"],
         dtype="str"
-    ).drop_duplicates(["CUI1", "CUI2"])
+    )
 
-    rel = rel[rel["CUI1"] != rel["CUI2"]]
+    mask_rels = rel["REL"].isin(wanted_rels)
+
+    mask_not_self = rel["CUI1"] != rel["CUI2"]
+
+    rel = (
+        rel[mask_rels & mask_not_self]
+        .drop_duplicates(["CUI1", "CUI2"])
+        .drop(columns="REL")
+    )
 
     if keep_cuis is not None:
         keep_series = cudf.Series(list(keep_cuis), dtype="str")
@@ -112,13 +122,15 @@ class GraphWrapper:
                  report_list,
                  neg_report_list,
                  id_to_index,
-                 set_to_id):
+                 set_to_id,
+                 neg_set_to_id):
 
         self.graph = graph
         self.id_map = id_map
         self.report_list = report_list
         self.neg_report_list = neg_report_list
         self.set_to_id = set_to_id
+        self.neg_set_to_id = neg_set_to_id
         self.set_to_indices = set_to_indices
         self.id_to_index = id_to_index
         self.cui_to_vid = dict(zip(id_map["CUI"].values_host, id_map["vid"].values_host))

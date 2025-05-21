@@ -6,6 +6,7 @@ from knowledge_graph.ic_metrics import resnik_bma, _mean_ic
 
 def dist(
     target: Set[str],
+    neg_target: Set[str],
     valid_refs: List[Set[str]],
     depth_sets: List[Set[str]],
     max_depth: int,
@@ -20,7 +21,7 @@ def dist(
     Extra hyper‑parameters are forwarded via **kwargs.
     """
     if type == "umls":
-        return umls_distance(target, valid_refs, depth_sets, max_depth, set_to_ids)
+        return umls_distance(target, neg_target, valid_refs, depth_sets, max_depth, set_to_ids)
     elif type == "jac":
         return jaccard_distance(target, valid_refs, set_to_ids)
     elif type == "dice":
@@ -38,13 +39,19 @@ def dist(
 
 
 # ours
-def umls_distance(target, valid_refs, depth_sets, max_depth, set_to_ids):
+def umls_distance(target, neg_target, valid_refs, depth_sets, max_depth, set_to_ids):
     scored = []
     for ref_cuis in valid_refs:
-        remove = len(target - (ref_cuis & target))
+        if neg_target is not None:
+            contradictions = len(neg_target & ref_cuis)
+            worst_possible_operation = max(max_depth, len(target))
+            contr_penalty = contradictions * sum(range(0, worst_possible_operation+2))
+        else:
+            contr_penalty = 0
+        remove = sum(range(1, len(target - (ref_cuis & target)) + 1))
         add_per_depth = [len(ds & ref_cuis) for ds in depth_sets]
         weighted_adds = sum((d + 1) * add_per_depth[d] for d in range(max_depth))
-        cost = remove + weighted_adds + abs(remove - sum(add_per_depth))
+        cost = remove + weighted_adds + abs(remove - weighted_adds) + contr_penalty
         for ref_id in set_to_ids[ref_cuis]:
             scored.append((ref_id, ref_cuis, cost))
     return scored
