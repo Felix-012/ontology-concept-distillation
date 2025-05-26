@@ -9,7 +9,7 @@ from pylibcugraph import SGGraph
 def build_graph(mrrel_path: Union[str, os.PathLike],
                 keep_cuis: Optional[set[str]] = None,
                 require_both: bool = True):
-    wanted_rels = ["SY", "PAR", "CHD", "RB", "RN", "RQ", "RL"]
+    #wanted_rels = ["SY", "PAR", "CHD", "RB", "RN", "RQ", "RL"]
 
     rel = cudf.read_csv(
         mrrel_path,
@@ -20,12 +20,11 @@ def build_graph(mrrel_path: Union[str, os.PathLike],
         dtype="str"
     )
 
-    mask_rels = rel["REL"].isin(wanted_rels)
-
     mask_not_self = rel["CUI1"] != rel["CUI2"]
 
+
     rel = (
-        rel[mask_rels & mask_not_self]
+        rel[mask_not_self]
         .drop_duplicates(["CUI1", "CUI2"])
         .drop(columns="REL")
     )

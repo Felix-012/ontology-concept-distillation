@@ -18,14 +18,16 @@ SAPBERT_MODEL_ID: str = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
 INDEX_DIR: Path = Path("/vol/ideadata/ce90tate/data/faiss/sapbert_umls_index")
 INDEX_FILE: Path = INDEX_DIR / "sapbert.index"
 MAPPING_FILE: Path = INDEX_DIR / "sapbert_id2cui.json"
-RRF_FILE: Path = Path("/vol/ideadata/ce90tate/data/umls/2024AB/META/MRCONSO.RRF")
+CONSO_FILE: Path = Path("/vol/ideadata/ce90tate/data/umls/2024AB/META/MRCONSO.RRF")
+DEF_FILE: Path = Path("/vol/ideadata/ce90tate/data/umls/2024AB/META/MRDEF.RRF")
+STY_FILE: Path = Path("/vol/ideadata/ce90tate/data/umls/2024AB/META/MRSTY.RRF")
 
 K_CANDIDATES: int = 40
 BATCHSIZE_EMBED: int = 128
 BATCHSIZE_LINK: int = 256
 USE_GPU: bool = torch.cuda.is_available()
 DTYPE = torch.float16 if USE_GPU else torch.float32
-DEVICE=3
+DEVICE=1
 
 @dataclass
 class Span:
@@ -45,9 +47,11 @@ class Mention:
     text: str
     span: Span
     category: str  # ANATOMY / OBSERVATION …
-    assertion: str  # present | negated | uncertain | na
+    assertion: str # present | negated | uncertain | na
+    mods: List[str]
     cui: Optional[str] = None
     score: Optional[float] = None
+
 
     def to_json(self) -> Dict:
         d = asdict(self)
@@ -58,7 +62,9 @@ class Mention:
 class ClinicalEntityLinker:
 
     def __init__(self,
-                 rrf_file,
+                 conso_file,
+                 sty_file,
+                 def_file,
                  sapbert_model_id,
                  mapping_file,
                  index_dir,
@@ -66,7 +72,7 @@ class ClinicalEntityLinker:
                  dtype=torch.float16,
                  device=0):
 
-        self.rrf_file = rrf_file
+        self.conso_file = conso_file
         self.index_dir = index_dir
         self.index_file = index_file
 
@@ -77,6 +83,8 @@ class ClinicalEntityLinker:
             sapbert_model_id, torch_dtype=dtype
         ).to(f"cuda:{device}")
         self.sapbert_tokenizer = AutoTokenizer.from_pretrained(sapbert_model_id)
+        #self.reranker_tokenizer = AutoTokenizer.from_pretrained("ncbi/MedCPT-Cross-Encoder")
+        #self.reranker_model = AutoModelForSequenceClassification.from_pretrained("ncbi/MedCPT-Cross-Encoder")
 
         if not Path(self.index_file).exists():
             rprint(
@@ -94,11 +102,22 @@ class ClinicalEntityLinker:
         self.index = faiss.index_cpu_to_gpu(res, 0, self.index, co)
         with open(mapping_file, "r", encoding="utf‑8") as fp:
             self.id2cui: Dict[str, str] = json.load(fp)
+        # at module level – build once
+        self.cats_to_allowed_sty = {"Observation": {"T047", "T033", "T019", "T037"},
+                                    "Anatomy":     {"T017", "T023", "T029", "T030", "T082"},}
+        self.cui2sty = _load_mrsty(sty_file)
+        #self.cui2def = _load_mrdef(def_file)
+        self.syns = self._load_umls_synonyms(conso_file)
+        self.cui2str = dict(self.syns.values)
+        self.importance_scores_sty = {"T047": 1, "T033": 1, "T019": 1,  "T037": 1,
+                                      "T017": 0, "T023": 0, "T029": 0, "T030": 0, "T082": 0}
 
     @classmethod
     def from_default_constants(cls):
         return cls(
-            rrf_file=RRF_FILE,
+            conso_file=CONSO_FILE,
+            sty_file=STY_FILE,
+            def_file=DEF_FILE,
             sapbert_model_id=SAPBERT_MODEL_ID,
             mapping_file=MAPPING_FILE,
             index_dir=INDEX_DIR,
@@ -126,9 +145,13 @@ class ClinicalEntityLinker:
             label = ent["label"]
             mention_text = ent["tokens"]
             relations = ent["relations"]
+            mods = [entities[r[1]]["tokens"]
+                    for r in relations
+                    if entities[r[1]]["label"].startswith("Anatomy")]
             if label.endswith("definitely absent"):
                 for relation in relations:
                     entities[relation[1]]["label"] = entities[relation[1]]["label"].replace("definitely present", "definitely absent")
+
 
 
             # Approximate char indices (token‑level indices available in ent)
@@ -152,35 +175,55 @@ class ClinicalEntityLinker:
                     span=Span(char_start, char_end),
                     category=clean_cat,
                     assertion=assertion,
+                    mods=mods
                 )
             )
         return mentions
 
 
-    def _link_mentions_batch(self, mentions: List[Mention], batchsize_link: int = BATCHSIZE_LINK):
+    def _link_mentions_batch(
+        self,
+        mentions: List[Mention],
+        batchsize_link: int = BATCHSIZE_LINK,
+        top_k: int = 64,                       # search >1 neighbour
+    ) -> None:
         if not mentions:
             return
-        # Deduplicate identical surface strings to minimise encoder work
-        unique_texts: List[str] = []
-        text_to_idx: Dict[str, int] = {}
+        surf_strings: List[str] = []
+        surf_to_idx: Dict[str, int] = {}
         for m in mentions:
-            if m.text not in text_to_idx:
-                text_to_idx[m.text] = len(unique_texts)
-                unique_texts.append(m.text)
+            mods = getattr(m, "mods", None) or []
+            surf = " ".join(mods + [m.text]).strip()  # e.g. "left lower lobe consolidation"
+            m._surface = surf  # stash for later look-up
+
+            if surf not in surf_to_idx:
+                surf_to_idx[surf] = len(surf_strings)
+                surf_strings.append(surf)
 
         all_vecs = []
-        for i in range(0, len(unique_texts), batchsize_link):
-            batch_vec = self._encode_text(unique_texts[i : i + batchsize_link])
+        for i in range(0, len(surf_strings), batchsize_link):
+            batch_vec = self._encode_text(surf_strings[i: i + batchsize_link])
             all_vecs.append(batch_vec)
         vecs = np.vstack(all_vecs)
-        sims, idxs = self.index.search(vecs, 1)
+        sims, idxs = self.index.search(vecs, top_k)
+        cuis = []
+        for i in range(len(idxs)):
+            cuis.append([self.id2cui[str(int(index))] for index in idxs[i]])
 
-        # Map back to each mention
         for m in mentions:
-            uidx = text_to_idx[m.text]
-            cui = self.id2cui[str(int(idxs[uidx][0]))]
-            m.cui = cui
-            m.score = float(sims[uidx][0])
+            uidx = surf_to_idx[m._surface]
+            cuis_mention = cuis[uidx]
+            chosen_rank = 0
+            allowed = self.cats_to_allowed_sty.get(m.category.split("::")[0])
+            if allowed:
+                for rank, index in enumerate(idxs[uidx]):
+                    cui = cuis_mention[rank]
+                    if self.cui2sty.get(cui) in allowed:
+                        chosen_rank = rank
+                        break
+
+            m.cui = self.id2cui[str(int(idxs[uidx][chosen_rank]))]
+            m.score = float(sims[uidx][chosen_rank])
 
 
     @torch.no_grad()
@@ -242,7 +285,7 @@ class ClinicalEntityLinker:
 
     def _build_faiss_index(self, batch_size_embed: int =BATCHSIZE_EMBED):
         self.index_dir.mkdir()
-        syn_df = self._load_umls_synonyms(self.rrf_file)
+        syn_df = self.syns
         id2cui: Dict[int, str] = {}
         names: List[str] = []
         for cui, name in syn_df.itertuples(index=False):
@@ -263,11 +306,27 @@ class ClinicalEntityLinker:
             json.dump({str(k): v for k, v in id2cui.items()}, fp)
         rprint(f"[green]Built FAISS index with {len(mat):,} vectors.[/green]")
 
+    def rerank(self, mention, cuis):
+        pairs = [[mention, self.cui2str[cui]] for cui in cuis]
 
-def get_mentions(path: Union[Path, str], impressions: List[str]) -> List[List[Mention]]:
+        with torch.no_grad():
+            encoded = self.reranker_tokenizer(
+                pairs,
+                truncation=True,
+                padding=True,
+                return_tensors="pt",
+                max_length=512,
+            )
+
+            logits = self.reranker_model(**encoded).logits.squeeze(dim=1)
+            reranked_cuis = [cui for _, cui in sorted(zip(logits, cuis), reverse=True)]
+            return reranked_cuis
+
+
+
+
+def get_mentions(linker: ClinicalEntityLinker, path: Union[Path, str], impressions: List[str]) -> List[List[Mention]]:
     if not Path.exists(Path(path)):
-
-        linker = ClinicalEntityLinker.from_default_constants()
 
         mentions = []
 
@@ -283,3 +342,34 @@ def get_mentions(path: Union[Path, str], impressions: List[str]) -> List[List[Me
         mentions = pickle.load(open(path, "rb"))
 
     return mentions
+
+
+def _load_mrsty(mrsty_path: Union[str, Path]) -> Dict[str, str]:
+    mrsty_path = Path(mrsty_path)
+    compression = "gzip" if mrsty_path.suffix == ".gz" else None
+    df = pd.read_csv(
+        mrsty_path,
+        sep="|",
+        header=None,
+        names=["CUI","TUI", "STN", "STY", "ATUI", "CVF", "EMPTY"],
+        usecols=["CUI", "TUI"],
+        dtype=str,
+        compression=compression,
+    )
+    return dict(df.values)
+
+
+def _load_mrdef(mrsty_path: Union[str, Path]) -> Dict[str, str]:
+    mrsty_path = Path(mrsty_path)
+    compression = "gzip" if mrsty_path.suffix == ".gz" else None
+    df = pd.read_csv(
+        mrsty_path,
+        sep="|",
+        header=None,
+        names=["CUI","AUI", "ATUI", "SATUI", "SAB", "DEF", "SUPPRESS", "CVF", "EMPTY"],
+        usecols=["CUI", "DEF"],
+        dtype=str,
+        compression=compression,
+    )
+    return dict(df.values)
+

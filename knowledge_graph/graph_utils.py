@@ -7,7 +7,6 @@ from knowledge_graph.graph import build_graph, GraphWrapper
 import random
 from typing import FrozenSet, Union, Dict, Tuple, Iterable, List, Set, Optional
 
-import pickle
 from collections import defaultdict
 import cudf, cugraph
 import cupy
@@ -15,7 +14,7 @@ from pylibcugraph import bfs, ResourceHandle, SGGraph, GraphProperties
 import cupy as cp
 
 from knowledge_graph.ic_metrics import ICGraphWrapper
-from knowledge_graph.ner import Mention, get_mentions
+from knowledge_graph.ner import Mention, get_mentions, ClinicalEntityLinker
 
 
 def _bfs_depth(handle: ResourceHandle, sg: SGGraph, sources: cudf.Series, depth: int = 2):
@@ -43,6 +42,7 @@ def k_closest_reference_reports(
     allow_empty_references: bool = False,
     cost_function: str = "umls",
     ic_graph_wrapper: ICGraphWrapper = None,
+    linker: ClinicalEntityLinker = None,
     neg_reference_reports: List[Tuple[str, Set[str]]] = None,
     neg_target = None,
     ids_to_index = None,
@@ -86,6 +86,7 @@ def k_closest_reference_reports(
 
         try:
             vids = {cui_to_vid[cui] for cui in target}
+
             neg_vids = None
             if neg_target is not None:
                 neg_vids = {cui_to_vid[cui] for cui in neg_target}
@@ -112,7 +113,7 @@ def k_closest_reference_reports(
             candidates = set_to_ids[frozenset()]
             cand_indices = ids_to_index[candidates]
             neg_candidates = [neg_reference_reports[cand_index][1] for cand_index in cand_indices]
-            scores_neg = dist(neg_target, neg_candidates, neg_depth_sets, max_depth, set_to_ids, type=cost_function)
+            scores_neg = dist(neg_target, neg_candidates, neg_depth_sets, max_depth, set_to_ids, linker, reachable, type=cost_function)
             cand_with_scores = list(zip(neg_candidates, scores_neg))
             cand_with_scores.sort(key=lambda pair: pair[1])
             sorted_neg_candidates, sorted_scores_neg = zip(*cand_with_scores)
@@ -132,7 +133,8 @@ def k_closest_reference_reports(
             for s in neg_depth_sets:
                 neg_reachable |= s
 
-        valid_refs = [cui_set for cui_set in unique_refs[target_id] if reachable.issuperset(cui_set)]
+        #valid_refs = [cui_set for cui_set in unique_refs[target_id] if reachable.issuperset(cui_set)]
+        valid_refs = [cui_set for cui_set in unique_refs[target_id] if len(reachable & cui_set) != 0]
         if not valid_refs:
             missing_sets = [cui_set - reachable for cui_set in unique_refs[target_id]]
             min_missing = min(len(m) for m in missing_sets)
@@ -140,6 +142,7 @@ def k_closest_reference_reports(
             to_add = best_missing_sets[0]
             reachable |= to_add
             valid_refs = [cui_set for cui_set in unique_refs[target_id] if reachable.issuperset(cui_set)]
+            #TODO: Add price for this
 
         valid_id_set = {
             id_
@@ -153,10 +156,11 @@ def k_closest_reference_reports(
                 if valid_id_set.intersection(neg_set_to_ids.get(neg_set, []))
             ]
 
+
         if ic_graph_wrapper is None:
-            scored = dist(target, neg_target, valid_refs, depth_sets, max_depth, set_to_ids, type=cost_function)
-            if neg_target:
-                scored_neg = dist(neg_target, None, valid_neg_refs, neg_depth_sets, max_depth, neg_set_to_ids, type=cost_function)
+            scored = dist(target, neg_target, valid_refs, depth_sets, max_depth, set_to_ids, linker, reachable, type=cost_function)
+            if neg_target and not neg_target:
+                scored_neg = dist(neg_target, None, valid_neg_refs, neg_depth_sets, max_depth, neg_set_to_ids, linker, reachable,type=cost_function)
                 neg_by_id = {t[0]: t for t in scored_neg}  # quick lookup by id
                 paired = [(pos, neg_by_id[pos[0]])
                           for pos in scored
@@ -251,11 +255,12 @@ def prepare_graph(mention_path: Union[str, os.PathLike],
                   impressions,
                   rff_file_path: Union[str, os.PathLike],
                   ids: List[str],
+                  linker: ClinicalEntityLinker,
                   *,
                   additional_cuis: Optional[Set] = None) -> GraphWrapper:
 
 
-    mentions = get_mentions(mention_path, impressions)
+    mentions = get_mentions(linker, mention_path, impressions)
 
     report_list, neg_report_list, set_to_indices = preprocess_mentions(mentions)
 
@@ -303,6 +308,4 @@ def bfs_trim_subgraph(handle: ResourceHandle,
     return sub_edges
 
 
-def get_k_nearest_image_paths_from_report(report: str, k: int) -> List[List[str]]:
-    pass
 
