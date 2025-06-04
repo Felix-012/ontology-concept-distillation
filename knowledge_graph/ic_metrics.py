@@ -1,7 +1,13 @@
+from __future__ import annotations
+
+import functools
+from typing import Set, FrozenSet, Dict
+
 import cudf
 import cugraph
 import cupy as cp
-from pylibcugraph import bfs
+import pylibcugraph
+from pylibcugraph import bfs, ResourceHandle
 
 import knowledge_graph.graph_utils
 
@@ -88,23 +94,115 @@ def _intrinsic_ic(G: cugraph.Graph):
     return ic
 
 
-def _ancestors(graph, handle, vertex):
-    bfs_df = bfs(handle, graph, cudf.Series(vertex), False, -1, False, False)
-    mask = bfs_df[0] < cp.iinfo(bfs_df[0].dtype).max
-    ancestors = bfs_df[2][mask]
-    return frozenset(ancestors.get())
+# ---------------------------------------------------------------------------
+# Ancestor cache helpers
+# ---------------------------------------------------------------------------
 
-def _resnik(graph, handle, cui1, cui2, ic_map):
-    anc1, anc2 = _ancestors(graph, handle, cui1), _ancestors(graph, handle, cui2)
-    common = anc1 & anc2
+@functools.lru_cache(maxsize=64)
+def _build_ancestor_cache(hash_key: int,
+                         handle: ResourceHandle,
+                         graph: pylibcugraph.SGGraph,
+                         seeds: tuple[int, ...]) -> Dict[int, FrozenSet[int]]:
+    """Run one multi‑source BFS and return {src: frozenset(ancestors)}.
+
+    The *hash_key* must uniquely identify the *graph* for the lifetime of the
+    cache (e.g. ``id(graph)`` or a user‑provided checksum).  By including it in
+    the lru_cache arguments we automatically invalidate the cache when the
+    caller switches to a different graph instance.
+    """
+
+    ancestors_map: Dict[int, FrozenSet[int]] = {}
+
+    # NB: `cp.iinfo` works for both int32 and int64 distances returned by BFS
+    for seed in seeds:
+        dist, _pred, verts = pylibcugraph.bfs(
+            handle,
+            graph,
+            cudf.Series([seed]),  # single source
+            False,  # direction_optimizing
+            -1,  # depth_limit
+            False, False  # (legacy) normalize / do_expensive_check
+        )
+
+        max_val = cp.iinfo(dist.dtype).max
+        reachable = verts[dist < max_val]
+
+        # Move the reachable-vertex vector to host and store as an immutable set
+        ancestors_map[int(seed)] = frozenset(cp.asnumpy(reachable))
+
+    return ancestors_map
+
+
+# ---------------------------------------------------------------------------
+# Resnik helpers
+# ---------------------------------------------------------------------------
+
+def _mica_ic(ic_map: cp.ndarray, anc_a: FrozenSet[int], anc_b: FrozenSet[int]) -> float:
+    """Return IC of the most informative common ancestor (MICA).
+
+    *ic_map* is a CuPy array indexed by integer concept id.  Using a dense array
+    gives true O(1) lookup inside the GPU intersection kernel below.
+    """
+    common = anc_a & anc_b
     if not common:
         return 0.0
-    return max(ic_map[n] for n in common)
+    idx = cp.asarray(list(common))
+    return float(ic_map[idx].max())
 
-def resnik_bma(graph, handle, setA, setB, ic_map):
-    scores_row = [max(_resnik(graph, handle, a, b, ic_map) for b in setB) for a in setA]
-    scores_col = [max(_resnik(graph, handle, b, a, ic_map) for a in setA) for b in setB]
-    return 0.5 * (sum(scores_row) / len(setA) + sum(scores_col) / len(setB))
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def resnik_bma(graph: cugraph.Graph,
+                    handle: cugraph.Graph,
+                    setA: Set[int],
+                    setB: Set[int],
+                    ic_map: cp.ndarray,
+                    *,
+                    graph_key: int = None) -> float:
+    """Compute Resnik Best‑Match Average (BMA) between *setA* and *setB*.
+
+    Parameters
+    ----------
+    graph, handle
+        The cuGraph graph object and its resource handle.
+    setA, setB
+        Sets of integer concept ids (e.g. CUIs).
+    ic_map
+        Dense array mapping concept id ➜ information content.
+    graph_key
+        Optional stable identifier for *graph*; defaults to ``id(graph)``.  Use
+        this if you frequently rebuild the graph object but the topology is the
+        same (to leverage the cache).
+    """
+    if not setA or not setB:
+        return 0.0
+
+    # ------------------------------------------------------------------
+    # 1. Ancestor cache (single GPU traversal for |A∪B| seeds)
+    # ------------------------------------------------------------------
+    seeds = tuple(sorted(setA | setB))
+    key = graph_key if graph_key is not None else id(graph)
+    ancestor_map = _build_ancestor_cache(key, handle, graph, seeds)
+
+    # ------------------------------------------------------------------
+    # 2. Vectorised best‑match max per row/col
+    # ------------------------------------------------------------------
+    def best_match(s1: Set[int], s2: Set[int]) -> cp.ndarray:
+        bm = cp.empty(len(s1), dtype=cp.float32)
+        for i, a in enumerate(s1):
+            # Compute IC scores against all *s2*; keep max
+            scores = cp.asarray([
+                _mica_ic(ic_map, ancestor_map[a], ancestor_map[b]) for b in s2
+            ], dtype=cp.float32)
+            bm[i] = scores.max() if scores.size else 0.0
+        return bm
+
+    scores_row = best_match(setA, setB)
+    scores_col = best_match(setB, setA)
+
+    return 0.5 * (scores_row.mean() + scores_col.mean())
 
 def bfs_level_dag(
     G: cugraph.Graph,
@@ -149,35 +247,69 @@ def bfs_level_dag(
 
     return G_dag, old_to_new, new_to_old
 
-def construct_ic_graph_wrapper(mrrel_path, keep_cuis, max_expl_depth) -> ICGraphWrapper:
-    HIER_REL = ["PAR", "CHD", "RN", "RB", ]
-    cols = ["CUI1","AUI1","STYPE1","REL","CUI2","AUI2","STYPE2",
-            "RELA","RUI","SRUI","SAB","SL","RG","DIR","SUPPRESS","CVF"]
-    mrrel = cudf.read_csv(mrrel_path,
-                          sep="|",
-                          names=cols,
-                          usecols=["CUI1", "REL", "CUI2", "SAB"],
-                          dtype={"CUI1": "str", "CUI2": "str", "REL": "str", "SAB": "str"})
+def construct_ic_graph_wrapper(mrhier_path, keep_cuis, max_expl_depth) -> ICGraphWrapper:
+    """
+    Build an IC-weighted GPU graph from the UMLS MRHIER table
+    (instead of the pruned MRREL table used previously).
 
-    mrrel = mrrel.to_pandas()
+    Parameters
+    ----------
+    mrhier_path : str
+        Path to `MRHIER.RRF` (pipe-delimited, *no* header row).
+    keep_cuis : Collection[str] | None
+        CUIs that **must** appear in the final graph (isolated self-loops
+        are added if a CUI has no hierarchical neighbours).
+    max_expl_depth : int
+        Maximum BFS depth to explore from each `keep_cui`.
 
-    mrrel = mrrel[mrrel.REL.isin(HIER_REL)]
-    mrrel = mrrel[mrrel["CUI1"] != mrrel["CUI2"]]
+    Returns
+    -------
+    ICGraphWrapper
+        Wrapper with the sub-DAG, RAPIDS handle, intrinsic-IC scores
+        and CUI ↔ vertex-id maps.
+    """
+    # ------------------------------------------------------------------
+    # 1.  Read MRHIER and extract child-parent CUI pairs
+    # ------------------------------------------------------------------
+    COLS = ["CUI", "AUI", "CXN", "PAUI", "SAB", "RELA",
+            "PTR", "HCD", "HXD", "HSG"]
+    mrhier = cudf.read_csv(
+        mrhier_path,
+        sep="|",
+        names=COLS,
+        usecols=["CUI", "AUI", "PAUI", "SAB"],
+        dtype={"CUI": "str", "AUI": "str", "PAUI": "str", "SAB": "str"}
+    ).to_pandas()
 
-    mrrel["child"] = mrrel["CUI1"]
-    mrrel["parent"] = mrrel["CUI2"]
+        # map AUI → CUI (needed to obtain the parent's CUI from PAUI)
+    aui_to_cui = (
+        mrhier[["AUI", "CUI"]]
+        .drop_duplicates(subset="AUI", keep="first")
+        .set_index("AUI")["CUI"]
+    )
 
-    mask_second_is_child = mrrel["REL"].isin(["CHD", "RB"])
-    mrrel.loc[mask_second_is_child, ["child", "parent"]] = mrrel.loc[mask_second_is_child, ["CUI2", "CUI1"]].values
+    # merge to get parent CUI; rows with unknown PAUI are dropped
+    mrhier["parent"] = mrhier["PAUI"].map(aui_to_cui)
+    mrhier = mrhier.dropna(subset=["parent"])
 
-    mrrel = cudf.from_pandas(mrrel)
+    # child / parent (exclude self-loops for now)
+    mrhier = mrhier[mrhier["CUI"] != mrhier["parent"]]
+    mrhier["child"] = mrhier["CUI"]
 
-    edges = mrrel[["child", "parent"]].rename(columns={"child": "src", "parent": "dst"})
 
-    id_map = cudf.DataFrame({
-        "CUI": cudf.concat([edges["src"], edges["dst"]]).unique()
-    })
-    id_map["vid"] = cp.arange(len(id_map), dtype="int32")  # contiguous 0 … N-1
+
+    # ------------------------------------------------------------------
+    # 2.  Convert to cuDF and build an edge list
+    # ------------------------------------------------------------------
+    edges = cudf.from_pandas(
+        mrhier[["child", "parent"]].rename(columns={"child": "src", "parent": "dst"})
+    )
+
+    # ------------------------------------------------------------------
+    # 3.  Create contiguous vertex ids
+    # ------------------------------------------------------------------
+    id_map = cudf.DataFrame({"CUI": cudf.concat([edges["src"], edges["dst"]]).unique()})
+    id_map["vid"] = cp.arange(len(id_map), dtype="int32")
 
     new_vids = None
     if keep_cuis is not None:
@@ -190,39 +322,41 @@ def construct_ic_graph_wrapper(mrrel_path, keep_cuis, max_expl_depth) -> ICGraph
             id_map = cudf.concat([id_map, new_id_map], ignore_index=True)
 
     cui_to_vid = dict(zip(id_map["CUI"].values_host, id_map["vid"].values_host))
-    vid_to_cui = dict(zip(id_map["vid"].values_host, id_map["CUI"].values_host))
+    vid_to_cui = {v: k for k, v in cui_to_vid.items()}
 
     edges = edges.assign(
         src=edges["src"].map(cui_to_vid),
         dst=edges["dst"].map(cui_to_vid)
     )
 
+    # add isolated self-loops for keep_cuis that had no neighbours
     if new_vids is not None and len(new_vids) > 0:
-        # create a self‐loop for every missing vid
-        isolated_vertices = cudf.DataFrame({
-            "src": new_vids,
-            "dst": new_vids
-        })
-        # tack them onto your real edges
-        edges = cudf.concat([edges, isolated_vertices], ignore_index=True)
+        isolated = cudf.DataFrame({"src": new_vids, "dst": new_vids})
+        edges = cudf.concat([edges, isolated], ignore_index=True)
 
-    G = cugraph.Graph(directed=True)  # directed = True by default
-    G.from_cudf_edgelist(edges,
-                         source="src",
-                         destination="dst",
-                         renumber=False)
+    # ------------------------------------------------------------------
+    # 4.  Build the GPU graph
+    # ------------------------------------------------------------------
+    G = cugraph.Graph(directed=True)
+    G.from_cudf_edgelist(edges, source="src", destination="dst", renumber=False)
 
-    keep_cuis = {cui_to_vid[cui] for cui in keep_cuis if cui in cui_to_vid.keys()}
+    keep_vids = {cui_to_vid[cui] for cui in keep_cuis if cui in cui_to_vid}
 
-    G_ic, old_to_new, new_to_old = bfs_level_dag(G, keep_cuis, max_expl_depth)
-    cui_to_vid = {cui: old_to_new[old_vid] for cui, old_vid in cui_to_vid.items() if old_vid in old_to_new.keys()}
-    vid_to_cui = {new_vid: vid_to_cui[old_vid] for new_vid, old_vid in new_to_old.items() if
-                  old_vid in vid_to_cui.keys()}
-    ic_scores = _intrinsic_ic(G_ic)
+    # ------------------------------------------------------------------
+    # 5.  Extract the BFS-level DAG around the keep CUIs and compute IC
+    # ------------------------------------------------------------------
+    #G_ic, old_to_new, new_to_old = bfs_level_dag(G, keep_vids, max_expl_depth)
+    #cui_to_vid = {cui: old_to_new[vid] for cui, vid in cui_to_vid.items() if vid in old_to_new}
+    #vid_to_cui = {new_vid: vid_to_cui[old_vid] for new_vid, old_vid in new_to_old.items()}
 
-    sg, handle = knowledge_graph.graph_utils.construct_gpu_graph(G_ic)
+    ic_scores = _intrinsic_ic(G)
 
-    return ICGraphWrapper(sg, handle, ic_scores, cui_to_vid=cui_to_vid, vid_to_cui=vid_to_cui)
+    sg, handle = knowledge_graph.graph_utils.construct_gpu_graph(G)
+
+    return ICGraphWrapper(sg, handle, ic_scores,
+                          cui_to_vid=cui_to_vid,
+                          vid_to_cui=vid_to_cui)
+
 
 
 def _mean_ic(concepts, ic_scores):

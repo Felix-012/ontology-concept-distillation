@@ -1,7 +1,9 @@
+import argparse
 import sys
 from pathlib import Path
 from typing import Dict, Tuple, Union
 import random
+import matplotlib.pyplot as plt
 
 import faiss
 import numpy as np
@@ -32,6 +34,9 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
     batch_size = config["hyperparameters"]["batch_size"]
 
     print(f"Score function: {config['retrieval_args']['cost_function']}")
+    print(f"alpha: {config['hyperparameters']['alpha']}")
+    print(f"beta: {config['hyperparameters']['beta']}")
+    print(f"Anomaly: {anomaly}")
     if config["retrieval_args"]["cost_function"] != "cosine_similarity":
         linker = ClinicalEntityLinker.from_default_constants()
     reports = []
@@ -92,7 +97,7 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
                          .union(*wrapper.neg_report_list)
                          .union(unbalanced_reports)
                          .union(neg_unbalanced_reports))
-            ic_graph_wrapper = construct_ic_graph_wrapper(config["mrrel_path"],
+            ic_graph_wrapper = construct_ic_graph_wrapper(config["mrhier_path"],
                                                           keep_cuis,
                                                           config["hyperparameters"]["max_expl_depth"])
 
@@ -100,6 +105,7 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
     df_anomaly = df_unbalanced[df_unbalanced[anomaly].fillna(False)]
     data = initialize_data(**config["init_data_args"], df=df_anomaly)
     batch_size = min(batch_size, len(data["reports"]))
+    acc_list = []
     for start in range(0, n_to_retrieve, batch_size):
         target_indices_anomaly = [(start + k) % len(data["reports"]) for k in range(batch_size)]
         target_indices = list(df_anomaly.iloc[target_indices_anomaly].index)
@@ -117,6 +123,7 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
             add_data.append(df_retrieval[image_path_column].iloc[indices])
             reports.append((indices[0], df_retrieval[report_column].iloc[indices].values[0]))
             acc = get_accuracy(df_retrieval, [report[0] for report in reports], anomaly)
+            acc_list.append(acc)
             sys.stdout.write("\rAccuracy %f Length %i" % (acc, len(reports)))
             sys.stdout.flush()
         else:
@@ -142,15 +149,18 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
                 mapped_reports,
                 mapped_targets,
                 wrapper.set_to_id,
+                alpha=config["hyperparameters"]["alpha"],
+                beta=config["hyperparameters"]["beta"],
                 k=config["hyperparameters"]["k"],
                 cost_function=config["retrieval_args"]["cost_function"],
                 max_depth=config["hyperparameters"]["max_expl_depth"],
                 linker=linker,
                 ic_graph_wrapper=ic_graph_wrapper,
+                graph_wrapper=wrapper,
                 ids_to_index=wrapper.id_to_index,
-                #neg_target=mapped_neg_targets,
-                #neg_reference_reports=mapped_neg_reports,
-                #neg_set_to_ids = wrapper.neg_set_to_id
+                neg_target=mapped_neg_targets,
+                neg_reference_reports=mapped_neg_reports,
+                neg_set_to_ids = wrapper.neg_set_to_id
             )
 
 
@@ -160,6 +170,7 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
                 add_data.append(df_retrieval[image_path_column].iloc[indices])
                 reports.append((indices[0], df_retrieval[report_column].iloc[indices].values[0]))
                 acc = get_accuracy(df_retrieval, [report[0] for report in reports], anomaly)
+                acc_list.append(acc)
                 sys.stdout.write("\rAccuracy %f Length %i" % (acc, len(reports)))
                 sys.stdout.flush()
                 used_ids = {df_retrieval.iloc[i][id_column] for i in indices}
@@ -173,7 +184,28 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
         model_name = config["cosine_similarity"]["type"]
     else:
         model_name = "No"
-    df_unbalanced.to_csv(f"{config['output_dir']}metric={config['retrieval_args']['cost_function']}_model={model_name}_{config['output_suffix']}")
+    plt.yticks(np.arange(0, 1, 0.05))
+    plt.plot(acc_list)
+
+    if config['retrieval_args']['cost_function'] in ["umls", "tversky"]:
+        stem = (
+            f"metric={config['retrieval_args']['cost_function']}_"
+            f"a={config['hyperparameters']['alpha']}_"
+            f"b={config['hyperparameters']['beta']}_"
+            f"model={model_name}_{anomaly}_{config['output_suffix']}"
+        )
+    else:
+        stem = (
+            f"metric={config['retrieval_args']['cost_function']}_"
+            f"model={model_name}_{config['output_suffix']}"
+        )
+
+
+    df_unbalanced.to_csv(f"{config['output_dir']}{stem}.csv", index=False)
+
+    plt.savefig(f"{stem}_plot.png")
+
+    pd.Series(acc_list).to_csv(f"{config['output_dir']}acc_list_{stem}.csv", index=False)
 
     return df_unbalanced
 
@@ -186,15 +218,25 @@ def get_accuracy(df, indices, label):
     return hits/len(indices)
 
 
-
+def parse_args():
+    parser = argparse.ArgumentParser()
+    #parser.add_argument("unbalanced_path", type=str, default=None)
+    #parser.add_argument("retrieval_path", type=str, default=None)
+    parser.add_argument("--config_path", type=str, default=None)
+    return parser.parse_args()
 
 if __name__ == "__main__":
     anomaly = "Consolidation"
+    args = parse_args()
+    if args.config_path is not None:
+        config_path = args.config_path
+    else:
+        config_path = f"/vol/ideadata/ce90tate/knowledge_graph_distance/configs/config_{anomaly}.yml"
+
     df_filled = fill_low_tail_classes(f"/vol/ideadata/ce90tate/knowledge_graph_distance/splits/longtail_8_train_unbalanced_{anomaly}.csv",
                           f"/vol/ideadata/ce90tate/knowledge_graph_distance/splits/longtail_8_balanced_retrieve.csv",
                                       "/vol/ideadata/ce90tate/knowledge_graph_distance/splits/longtail_8_balanced_train.csv",
-                          f"/vol/ideadata/ce90tate/knowledge_graph_distance/config_{anomaly}.yml",
-                                      anomaly=anomaly)
+                          config_path, anomaly=anomaly)
 
 
 

@@ -15,7 +15,7 @@ from radgraph import RadGraph
 
 # constants for from_default_constants()
 SAPBERT_MODEL_ID: str = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
-INDEX_DIR: Path = Path("/vol/ideadata/ce90tate/data/faiss/sapbert_umls_index")
+INDEX_DIR: Path = Path("/vol/ideadata/ce90tate/data/faiss/sapbert_umls_index_snomed")
 INDEX_FILE: Path = INDEX_DIR / "sapbert.index"
 MAPPING_FILE: Path = INDEX_DIR / "sapbert_id2cui.json"
 CONSO_FILE: Path = Path("/vol/ideadata/ce90tate/data/umls/2024AB/META/MRCONSO.RRF")
@@ -70,7 +70,7 @@ class ClinicalEntityLinker:
                  index_dir,
                  index_file,
                  dtype=torch.float16,
-                 device=0):
+                 device=DEVICE):
 
         self.conso_file = conso_file
         self.index_dir = index_dir
@@ -83,6 +83,7 @@ class ClinicalEntityLinker:
             sapbert_model_id, torch_dtype=dtype
         ).to(f"cuda:{device}")
         self.sapbert_tokenizer = AutoTokenizer.from_pretrained(sapbert_model_id)
+        self.syns = self._load_umls_synonyms(conso_file)
         #self.reranker_tokenizer = AutoTokenizer.from_pretrained("ncbi/MedCPT-Cross-Encoder")
         #self.reranker_model = AutoModelForSequenceClassification.from_pretrained("ncbi/MedCPT-Cross-Encoder")
 
@@ -99,7 +100,7 @@ class ClinicalEntityLinker:
         co.useFloat16 = True
         co.indicesOptions = faiss.INDICES_32_BIT
         rprint("[bold cyan]Moving index to GPU…[/bold cyan]")
-        self.index = faiss.index_cpu_to_gpu(res, 0, self.index, co)
+        self.index = faiss.index_cpu_to_gpu(res, DEVICE, self.index, co)
         with open(mapping_file, "r", encoding="utf‑8") as fp:
             self.id2cui: Dict[str, str] = json.load(fp)
         # at module level – build once
@@ -107,9 +108,8 @@ class ClinicalEntityLinker:
                                     "Anatomy":     {"T017", "T023", "T029", "T030", "T082"},}
         self.cui2sty = _load_mrsty(sty_file)
         #self.cui2def = _load_mrdef(def_file)
-        self.syns = self._load_umls_synonyms(conso_file)
         self.cui2str = dict(self.syns.values)
-        self.importance_scores_sty = {"T047": 1, "T033": 1, "T019": 1,  "T037": 1,
+        self.importance_scores_sty = {"T047": 2, "T033": 1, "T019": 0,  "T037": 0,
                                       "T017": 0, "T023": 0, "T029": 0, "T030": 0, "T082": 0}
 
     @classmethod
@@ -275,11 +275,11 @@ class ClinicalEntityLinker:
             sep="|",
             header=None,
             names=col_names,
-            usecols=["CUI", "LAT", "TS", "STR"],
+            usecols=["CUI", "LAT", "TS", "SAB", "STR"],
             dtype=str,
             compression=compression,
         )
-        df = df.loc[(df["LAT"] == "ENG") & (df["TS"] != "S"), ["CUI", "STR"]]
+        df = df.loc[(df["LAT"] == "ENG") & (df["TS"] != "S") & (df["SAB"] == "SNOMEDCT_US"), ["CUI", "STR"]]
         df.dropna(subset=["CUI", "STR"], inplace=True)
         return df.reset_index(drop=True)
 

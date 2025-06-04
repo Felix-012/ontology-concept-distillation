@@ -1,7 +1,7 @@
 import os
 from itertools import repeat
 
-from knowledge_graph.cost_functions import dist, ic_dist
+from knowledge_graph.cost_functions import dist, ic_dist, apply_filter
 from knowledge_graph.graph import build_graph, GraphWrapper
 
 import random
@@ -18,12 +18,12 @@ from knowledge_graph.ner import Mention, get_mentions, ClinicalEntityLinker
 
 
 def _bfs_depth(handle: ResourceHandle, sg: SGGraph, sources: cudf.Series, depth: int = 2):
-    distances, _, vertices = bfs(handle, sg, sources,
+    distances, predecessors, vertices = bfs(handle, sg, sources,
                                  False,
                                  depth,
-                                 False,
+                                 True,
                                  False)
-    return distances, vertices
+    return distances, predecessors, vertices
 
 
 
@@ -42,7 +42,10 @@ def k_closest_reference_reports(
     allow_empty_references: bool = False,
     cost_function: str = "umls",
     ic_graph_wrapper: ICGraphWrapper = None,
+    graph_wrapper: GraphWrapper = None,
     linker: ClinicalEntityLinker = None,
+    alpha: float = 1.0,
+    beta: float = 1.0,
     neg_reference_reports: List[Tuple[str, Set[str]]] = None,
     neg_target = None,
     ids_to_index = None,
@@ -94,18 +97,44 @@ def k_closest_reference_reports(
             raise ValueError(f"CUI {e.args[0]!r} from target_report not in id_map")
 
         if vids:
-            distances, vertices = _bfs_depth(handle, sg, cudf.Series(list(vids)), depth=max_depth)
-            depth_sets: List[Set[str]] = []
+            # Run the BFS as before
+            distances, predecessors, vertices = _bfs_depth(
+                handle, sg, cudf.Series(list(vids)), depth=max_depth
+            )
+
+            # ── 1.  Build handy NumPy views for fast look-ups ────────────────────────────────
+            vert_np = cupy.asnumpy(vertices)  # vertex-id order returned by cugraph
+            pred_np = cupy.asnumpy(predecessors)  # predecessor of each vertex (‒1 for roots)
+            dist_np = cupy.asnumpy(distances)
+            dist_np[dist_np >= cupy.iinfo(dist_np.dtype).max] = -1
+            graph_wrapper.depth_of = dict(zip(vert_np, dist_np))
+            graph_wrapper.pred_map = dict(zip(vert_np, pred_np))  # {vertex → predecessor}
+
+            depth_sets: list[set[str]] = []  # CUIs newly discovered at depth d
+
             for d in range(1, max_depth + 1):
-                vids_at_d = cupy.asnumpy(vertices[distances == d])
+                vids_at_d = vert_np[dist_np == d]
+
                 depth_sets.append({vid_to_cui[v] for v in vids_at_d})
 
         if neg_vids:
-            distances, vertices = _bfs_depth(handle, sg, cudf.Series(list(neg_vids)), depth=max_depth)
+            distances, predecessors, vertices = _bfs_depth(handle, sg, cudf.Series(list(neg_vids)), depth=max_depth)
             neg_depth_sets: List[Set[str]] = []
             for d in range(1, max_depth + 1):
                 vids_at_d = cupy.asnumpy(vertices[distances == d])
                 neg_depth_sets.append({vid_to_cui[v] for v in vids_at_d})
+        '''
+        dist_from_t = {}
+        for t_cui in target:
+            t_vid = cui_to_vid[t_cui]
+            d, p, v = _bfs_depth(handle, sg, cudf.Series([t_vid]), depth=max_depth)
+
+            dist_from_t[t_cui] = {
+                int(vv): int(dd)
+                for vv, dd in zip(cupy.asnumpy(v), cupy.asnumpy(d))
+                if 0 < dd <= max_depth  # skip the source itself
+            }
+        '''
 
 
         if not target:
@@ -135,6 +164,7 @@ def k_closest_reference_reports(
 
         #valid_refs = [cui_set for cui_set in unique_refs[target_id] if reachable.issuperset(cui_set)]
         valid_refs = [cui_set for cui_set in unique_refs[target_id] if len(reachable & cui_set) != 0]
+
         if not valid_refs:
             missing_sets = [cui_set - reachable for cui_set in unique_refs[target_id]]
             min_missing = min(len(m) for m in missing_sets)
@@ -142,7 +172,6 @@ def k_closest_reference_reports(
             to_add = best_missing_sets[0]
             reachable |= to_add
             valid_refs = [cui_set for cui_set in unique_refs[target_id] if reachable.issuperset(cui_set)]
-            #TODO: Add price for this
 
         valid_id_set = {
             id_
@@ -156,9 +185,8 @@ def k_closest_reference_reports(
                 if valid_id_set.intersection(neg_set_to_ids.get(neg_set, []))
             ]
 
-
         if ic_graph_wrapper is None:
-            scored = dist(target, neg_target, valid_refs, depth_sets, max_depth, set_to_ids, linker, reachable, type=cost_function)
+            scored = dist(target, neg_target, valid_refs, depth_sets, max_depth, set_to_ids, linker, reachable, graph_wrapper, type=cost_function, alpha=alpha, beta=beta)
             if neg_target and not neg_target:
                 scored_neg = dist(neg_target, None, valid_neg_refs, neg_depth_sets, max_depth, neg_set_to_ids, linker, reachable,type=cost_function)
                 neg_by_id = {t[0]: t for t in scored_neg}  # quick lookup by id
@@ -278,7 +306,7 @@ def prepare_graph(mention_path: Union[str, os.PathLike],
 
     id_to_index = dict(zip(ids, list(range(len(ids)))))
 
-    G, id_map = build_graph(rff_file_path, keep_cuis=keep_cuis)
+    G, id_map, rel_dict = build_graph(rff_file_path, keep_cuis=keep_cuis)
 
     return GraphWrapper(G,
                         id_map,
@@ -287,7 +315,8 @@ def prepare_graph(mention_path: Union[str, os.PathLike],
                         neg_report_list,
                         id_to_index,
                         set_to_id,
-                        neg_set_to_id)
+                        neg_set_to_id,
+                        rel_dict)
 
 
 def bfs_trim_subgraph(handle: ResourceHandle,
