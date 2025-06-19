@@ -1,9 +1,10 @@
 import json
+import spacy
 import pickle
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
-
+from negspacy.negation import Negex
 import faiss
 import numpy as np
 import pandas as pd
@@ -15,11 +16,12 @@ from radgraph import RadGraph
 
 # constants for from_default_constants()
 SAPBERT_MODEL_ID: str = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
-INDEX_DIR: Path = Path("/vol/ideadata/ce90tate/data/faiss/sapbert_umls_index_snomed")
+#SAPBERT_MODEL_ID: str = "microsoft/BiomedNLP-KRISSBERT-PubMed-UMLS-EL"
+INDEX_DIR: Path = Path("/vol/ideadata/ce90tate/data/faiss/sapbert_umls_index_t046")
 INDEX_FILE: Path = INDEX_DIR / "sapbert.index"
 MAPPING_FILE: Path = INDEX_DIR / "sapbert_id2cui.json"
 CONSO_FILE: Path = Path("/vol/ideadata/ce90tate/data/umls/2024AB/META/MRCONSO.RRF")
-DEF_FILE: Path = Path("/vol/ideadata/ce90tate/data/umls/2024AB/META/MRDEF.RRF")
+MRREL_FILE: Path = Path("/vol/ideadata/ce90tate/data/umls/2024AB/META/MRREL.RRF")
 STY_FILE: Path = Path("/vol/ideadata/ce90tate/data/umls/2024AB/META/MRSTY.RRF")
 
 K_CANDIDATES: int = 40
@@ -27,7 +29,19 @@ BATCHSIZE_EMBED: int = 128
 BATCHSIZE_LINK: int = 256
 USE_GPU: bool = torch.cuda.is_available()
 DTYPE = torch.float16 if USE_GPU else torch.float32
-DEVICE=1
+DEVICE=3
+
+LABELS = ["Atelectasis",
+          "Cardiomegaly",
+          "Consolidation",
+          "Edema",
+          "Effusion",
+          "Pneumonia",
+          "Pneumothorax",
+          "Opacity",
+          "Device",
+          "Fracture"
+          ]
 
 @dataclass
 class Span:
@@ -50,7 +64,11 @@ class Mention:
     assertion: str # present | negated | uncertain | na
     mods: List[str]
     cui: Optional[str] = None
-    score: Optional[float] = None
+    cui_text: Optional[str] = None,
+    cui_surface: Optional[str] = None,
+    score: Optional[float] = None,
+    score_text: Optional[str] = None,
+    score_surface: Optional[str] = None,
 
 
     def to_json(self) -> Dict:
@@ -64,14 +82,15 @@ class ClinicalEntityLinker:
     def __init__(self,
                  conso_file,
                  sty_file,
-                 def_file,
+                 mrrel_file,
                  sapbert_model_id,
                  mapping_file,
                  index_dir,
                  index_file,
                  dtype=torch.float16,
                  device=DEVICE):
-
+        self._nlp = spacy.load("en_core_sci_lg")
+        self._nlp.add_pipe("negex")
         self.conso_file = conso_file
         self.index_dir = index_dir
         self.index_file = index_file
@@ -104,20 +123,23 @@ class ClinicalEntityLinker:
         with open(mapping_file, "r", encoding="utf‑8") as fp:
             self.id2cui: Dict[str, str] = json.load(fp)
         # at module level – build once
-        self.cats_to_allowed_sty = {"Observation": {"T047", "T033", "T019", "T037"},
+        self.cats_to_allowed_sty = {"Observation": {"T047", "T046", "T033", "T019", "T037"},
                                     "Anatomy":     {"T017", "T023", "T029", "T030", "T082"},}
         self.cui2sty = _load_mrsty(sty_file)
         #self.cui2def = _load_mrdef(def_file)
         self.cui2str = dict(self.syns.values)
-        self.importance_scores_sty = {"T047": 2, "T033": 1, "T019": 0,  "T037": 0,
+        self.importance_scores_sty = {"T047": 3, "T046": 2, "T033": 1, "T019": 0,  "T037": 0,
                                       "T017": 0, "T023": 0, "T029": 0, "T030": 0, "T082": 0}
+        #self.relations = self._load_mrrel(mrrel_file)
+        self.relations = None
+
 
     @classmethod
     def from_default_constants(cls):
         return cls(
             conso_file=CONSO_FILE,
             sty_file=STY_FILE,
-            def_file=DEF_FILE,
+            mrrel_file=MRREL_FILE,
             sapbert_model_id=SAPBERT_MODEL_ID,
             mapping_file=MAPPING_FILE,
             index_dir=INDEX_DIR,
@@ -132,99 +154,154 @@ class ClinicalEntityLinker:
         self._link_mentions_batch(mentions)
         return mentions
 
-
     def _infer_ner(self, note: str) -> List[Mention]:
-        """Run RadGraph and convert its output to List[Mention]."""
-        ann = self.radgraph([note])
-        # Grab first (and only) doc
-        ann_doc = next(iter(ann.values())) if isinstance(ann, dict) else ann[0]
-        entities = ann_doc["entities"]
+        small_note = len(note.split()) < 3
+        if small_note:
+            alt_assertion = self._negation_tool(note)
+
+        sentences = [s.text.strip() for s in self._nlp(note).sents]
+        ann_sent = self.radgraph(sentences)
+        ann_note = self.radgraph([note]) if len(sentences) > 1 else ann_sent
+
+        ann_sent_docs = list(ann_sent.values()) if isinstance(ann_sent, dict) else ann_sent
+        ann_note_doc = next(iter(ann_note.values())) if isinstance(ann_note, dict) else ann_note[0]
+        note_label_map = {e["tokens"].lower(): e["label"] for e in ann_note_doc["entities"].values()}
 
         mentions: List[Mention] = []
-        for ent in entities.values():
-            label = ent["label"]
-            mention_text = ent["tokens"]
-            relations = ent["relations"]
-            mods = [entities[r[1]]["tokens"]
+        for ann_doc in ann_sent_docs:
+            entities = ann_doc["entities"]
+
+            for ent in entities.values():
+                tok = ent["tokens"].lower()
+                if tok in note_label_map:
+                    ent["label"] = note_label_map[tok]
+
+            for ent in entities.values():
+                if ent["label"].endswith("definitely absent"):
+                    for r in ent["relations"]:
+                        rel_ent = entities[r[1]]
+                        if rel_ent["label"].endswith("definitely present"):
+                            rel_has_present = any(
+                                entities[rr[1]]["label"].endswith("definitely present")
+                                for rr in rel_ent["relations"]
+                            )
+                            if not rel_has_present:
+                                rel_ent["label"] = rel_ent["label"].replace(
+                                    "definitely present", "definitely absent"
+                                )
+
+            for ent in entities.values():
+                label = ent["label"]
+                mention_text = ent["tokens"]
+                relations = ent["relations"]
+                mods = [
+                    entities[r[1]]["tokens"]
                     for r in relations
-                    if entities[r[1]]["label"].startswith("Anatomy")]
-            if label.endswith("definitely absent"):
-                for relation in relations:
-                    entities[relation[1]]["label"] = entities[relation[1]]["label"].replace("definitely present", "definitely absent")
+                    if entities[r[1]]["label"].startswith("Anatomy")
+                ]
 
+                char_start = note.lower().find(mention_text.lower())
+                char_end = char_start + len(mention_text) if char_start != -1 else -1
 
+                assertion = {
+                    "Observation::definitely present": "present",
+                    "Observation::definitely absent": "absent",
+                    "Observation::uncertain": "uncertain",
+                    "Anatomy::definitely present": "present",
+                    "Anatomy::definitely absent": "absent",
+                    "Anatomy::uncertain": "uncertain",
+                }.get(label, "na")
 
-            # Approximate char indices (token‑level indices available in ent)
-            char_start = note.lower().find(mention_text.lower())
-            char_end = char_start + len(mention_text) if char_start != -1 else -1
+                if small_note and alt_assertion:
+                    if alt_assertion in {"present", "absent", "uncertain"} and alt_assertion != assertion:
+                        print(f"{alt_assertion}: {note}")
+                        assertion = alt_assertion
 
-            assertion = {
-                'Observation::definitely present': "present",
-                'Observation::definitely absent': "absent",
-                'Observation::uncertain': "uncertain",
-                'Anatomy::definitely present': "present",
-                'Anatomy::definitely absent': "absent",
-                'Anatomy::uncertain': "uncertain"
-            }.get(label, "na")
-
-            clean_cat = label.replace("NEGATED_", "").replace("UNCERTAIN_", "")
-
-            mentions.append(
-                Mention(
-                    text=mention_text,
-                    span=Span(char_start, char_end),
-                    category=clean_cat,
-                    assertion=assertion,
-                    mods=mods
+                mentions.append(
+                    Mention(
+                        text=mention_text,
+                        span=Span(char_start, char_end),
+                        category=label,
+                        assertion=assertion,
+                        mods=mods,
+                    )
                 )
-            )
         return mentions
 
-
     def _link_mentions_batch(
-        self,
-        mentions: List[Mention],
-        batchsize_link: int = BATCHSIZE_LINK,
-        top_k: int = 64,                       # search >1 neighbour
+            self,
+            mentions: List[Mention],
+            batchsize_link: int = BATCHSIZE_LINK,
+            top_k: int = 128,
     ) -> None:
         if not mentions:
             return
-        surf_strings: List[str] = []
-        surf_to_idx: Dict[str, int] = {}
+
+        surf_strings: List[str] = []  # global list → ANN query order
+        string_to_idx: Dict[str, int] = {}  # cache to avoid duplicates
+
+
         for m in mentions:
             mods = getattr(m, "mods", None) or []
-            surf = " ".join(mods + [m.text]).strip()  # e.g. "left lower lobe consolidation"
-            m._surface = surf  # stash for later look-up
+            surf_str = " ".join(mods + [m.text]).strip()  # “surface”
+            text_str = m.text.strip()  # plain text
 
-            if surf not in surf_to_idx:
-                surf_to_idx[surf] = len(surf_strings)
-                surf_strings.append(surf)
+            # register / deduplicate both strings
+            for s in (surf_str, text_str):
+                if s not in string_to_idx:
+                    string_to_idx[s] = len(surf_strings)
+                    surf_strings.append(s)
 
-        all_vecs = []
-        for i in range(0, len(surf_strings), batchsize_link):
-            batch_vec = self._encode_text(surf_strings[i: i + batchsize_link])
-            all_vecs.append(batch_vec)
-        vecs = np.vstack(all_vecs)
+            # remember the row indices for later look-up
+            m._surface_idx = string_to_idx[surf_str]
+            m._text_idx = string_to_idx[text_str]
+
+        vecs = np.vstack(
+            [
+                self._encode_text(surf_strings[i: i + batchsize_link])
+                for i in range(0, len(surf_strings), batchsize_link)
+            ]
+        )
         sims, idxs = self.index.search(vecs, top_k)
-        cuis = []
-        for i in range(len(idxs)):
-            cuis.append([self.id2cui[str(int(index))] for index in idxs[i]])
+        cuis_per_row = [
+            [self.id2cui[str(int(idx))] for idx in row] for row in idxs
+        ]
 
         for m in mentions:
-            uidx = surf_to_idx[m._surface]
-            cuis_mention = cuis[uidx]
-            chosen_rank = 0
-            allowed = self.cats_to_allowed_sty.get(m.category.split("::")[0])
-            if allowed:
-                for rank, index in enumerate(idxs[uidx]):
-                    cui = cuis_mention[rank]
-                    if self.cui2sty.get(cui) in allowed:
-                        chosen_rank = rank
-                        break
+            allowed_stys = self.cats_to_allowed_sty.get(
+                m.category.split("::")[0], None
+            )
 
-            m.cui = self.id2cui[str(int(idxs[uidx][chosen_rank]))]
-            m.score = float(sims[uidx][chosen_rank])
+            def _select(row_idx: int) -> tuple[str, float]:
+                """Return (cui, score) for a single ANN result row."""
+                cand_cuis, cand_sims, cand_idxs = (
+                    cuis_per_row[row_idx],
+                    sims[row_idx],
+                    idxs[row_idx],
+                )
 
+                # take the first CUI whose semantic-type is allowed
+                for rank, cui in enumerate(cand_cuis):
+                    if (allowed_stys is None) or (self.cui2sty.get(cui) in allowed_stys):
+                        return (
+                            self.id2cui[str(int(cand_idxs[rank]))],
+                            float(cand_sims[rank]),
+                        )
+
+                # fallback: very top ANN hit
+                return (
+                    self.id2cui[str(int(cand_idxs[0]))],
+                    float(cand_sims[0]),
+                )
+
+            # surface-based link
+            m.cui_surface, m.score_surface = _select(m._surface_idx)
+
+            # plain-text link
+            m.cui_text, m.score_text = _select(m._text_idx)
+
+            m.cui = m.cui_surface
+            m.score = m.score_surface
 
     @torch.no_grad()
     def _encode_text(self, text: Union[str, List[str]]) -> np.ndarray:
@@ -322,7 +399,88 @@ class ClinicalEntityLinker:
             reranked_cuis = [cui for _, cui in sorted(zip(logits, cuis), reverse=True)]
             return reranked_cuis
 
+    def _load_mrrel(self, mrrel_path: Union[str, Path]) -> Dict:
+        """
+        Load MRREL.RRF (or a subset of it) and keep only
+          • REL ∈ {"RN", "CHD"}
+          • CUI1 ≠ CUI2
+          • BOTH CUIs have at least one semantic-type code in the allowed set
+        """
+        # ------------------------------------------------------------------
+        # 1.  Basic MRREL filters (relationship & self-loops)
+        # ------------------------------------------------------------------
+        wanted_rels = {"PAR"}
 
+        rel = pd.read_csv(
+            mrrel_path,
+            sep="|",
+            header=None,
+            usecols=[0, 3, 4, 11],
+            names=["CUI1", "REL", "CUI2", "SL"],
+            dtype="str"
+        )
+
+        mask_not_self = rel["CUI1"] != rel["CUI2"]
+        mask_wanted_rel = rel["REL"].isin(wanted_rels)
+        mask_source = rel["SL"] == "SNOMEDCT_US"
+        rel = rel.loc[mask_not_self & mask_wanted_rel & mask_source]
+
+        # ------------------------------------------------------------------
+        # 2.  Semantic-type filter
+        # ------------------------------------------------------------------
+        # Build a flat set of all allowed STY codes once
+        allowed_sty: set[str] = {"T047", "T046", "T033"}
+
+        def has_allowed_sty(cui: str) -> bool:
+            """
+            True ⟺ this CUI is mapped to ≥1 allowed semantic type.
+            self.cui2sty may map a CUI to:
+              • a single STY code  -> str
+              • a sequence / set   -> iterable
+            """
+            sty_codes = self.cui2sty.get(cui, ())
+            if isinstance(sty_codes, str):
+                sty_codes = (sty_codes,)
+
+            return any(sty in allowed_sty for sty in sty_codes)
+
+        mask_cui1_allowed = rel["CUI1"].apply(has_allowed_sty)
+        mask_cui2_allowed = rel["CUI2"].apply(has_allowed_sty)
+
+        rel = rel.loc[mask_cui1_allowed & mask_cui2_allowed]
+
+        # ------------------------------------------------------------------
+        # 3.  Final de-dup & return
+        # ------------------------------------------------------------------
+        rel = rel.drop_duplicates(["CUI1", "CUI2"])
+        return rel.groupby("CUI1")['CUI2'].apply(list).to_dict()
+
+    def _negation_tool(self, note: str) -> str:
+        """
+        Determine whether the given note indicates presence, uncertainty, or absence.
+        Expects note to be a short string (more than 3 words).
+        Returns one of: "present", "uncertain", "absent".
+        """
+        words = note.lower().split()
+        if len(words) < 4:
+            raise ValueError("Input note must be at least 4 words")
+
+        # Define your trigger keywords (customize these lists as needed)
+        ABSENCE_KEYWORDS = {"no", "not", "none", "without", "absent"}
+        UNCERTAIN_KEYWORDS = {"maybe", "possible", "unclear", "could", "might", "suspect"}
+
+        # If any uncertainty cue appears, mark as uncertain
+        for kw in UNCERTAIN_KEYWORDS:
+            if kw in words:
+                return "uncertain"
+
+        # If any negation / absence cue appears, mark as absent
+        for kw in ABSENCE_KEYWORDS:
+            if kw in words:
+                return "absent"
+
+        # Default to present
+        return "present"
 
 
 def get_mentions(linker: ClinicalEntityLinker, path: Union[Path, str], impressions: List[str]) -> List[List[Mention]]:
@@ -372,4 +530,43 @@ def _load_mrdef(mrsty_path: Union[str, Path]) -> Dict[str, str]:
         compression=compression,
     )
     return dict(df.values)
+
+
+
+def create_labels(ids, mentions, linker):
+    label_dict = {}
+    for id, mentions_per_report in zip(ids, mentions):
+        label_dict[id] = set()
+        for mention in mentions_per_report:
+            has_label = False
+            for label in LABELS:
+                if label.lower() in linker.cui2str[mention.cui_text].lower() or \
+                    label.lower() in linker.cui2str[mention.cui_surface].lower():
+                    label_dict[id].add((label, mention.assertion))
+                    has_label = True
+            if not has_label:
+                for label in LABELS:
+                    broader_surf = linker.relations.get(mention.cui_surface)
+                    broader_text = linker.relations.get(mention.cui_text)
+                    if broader_surf is None:
+                        broader_surf = set()
+                    else:
+                        broader_surf = set(broader_surf)
+                    if broader_text is None:
+                        broader_text = set()
+                    else:
+                        broader_text = set(broader_text)
+                    broader = broader_surf | broader_text
+
+                    for broad in broader:
+                        if label.lower() in linker.cui2str.get(broad, "").lower():
+                            label_dict[id].add((label, mention.assertion))
+
+        if len(label_dict[id]) == 0:
+            label_dict[id] = {("No Finding", "present")}
+    return label_dict
+
+
+
+
 

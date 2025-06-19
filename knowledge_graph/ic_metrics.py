@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import functools
-from typing import Set, FrozenSet, Dict
+from collections import defaultdict
+from typing import Set, FrozenSet, Dict, List
 
 import cudf
 import cugraph
@@ -94,55 +95,55 @@ def _intrinsic_ic(G: cugraph.Graph):
     return ic
 
 
-# ---------------------------------------------------------------------------
-# Ancestor cache helpers
-# ---------------------------------------------------------------------------
+###############################################################################
+# Ancestor helpers
+###############################################################################
 
-@functools.lru_cache(maxsize=64)
-def _build_ancestor_cache(hash_key: int,
-                         handle: ResourceHandle,
-                         graph: pylibcugraph.SGGraph,
-                         seeds: tuple[int, ...]) -> Dict[int, FrozenSet[int]]:
-    """Run one multi‑source BFS and return {src: frozenset(ancestors)}.
+# Global cache: graph_id → {child: [parent, …]}
+_parent_index_cache: Dict[int, Dict[int, List[int]]] = {}
 
-    The *hash_key* must uniquely identify the *graph* for the lifetime of the
-    cache (e.g. ``id(graph)`` or a user‑provided checksum).  By including it in
-    the lru_cache arguments we automatically invalidate the cache when the
-    caller switches to a different graph instance.
+
+def _build_parent_index(graph: cugraph.Graph) -> Dict[int, List[int]]:
+    """Return a mapping *child → [parent, …]* built from the edges of *graph*.
+
+    Expects each edge to point **child → parent**.  If your graph stores the
+    opposite direction, call ``graph.reverse(copy=False)`` first or adapt this
+    function.
     """
+    df = graph.view_edge_list()
+    src_h = df['src'].values_host
+    dst_h = df['dst'].values_host
 
-    ancestors_map: Dict[int, FrozenSet[int]] = {}
-
-    # NB: `cp.iinfo` works for both int32 and int64 distances returned by BFS
-    for seed in seeds:
-        dist, _pred, verts = pylibcugraph.bfs(
-            handle,
-            graph,
-            cudf.Series([seed]),  # single source
-            False,  # direction_optimizing
-            -1,  # depth_limit
-            False, False  # (legacy) normalize / do_expensive_check
-        )
-
-        max_val = cp.iinfo(dist.dtype).max
-        reachable = verts[dist < max_val]
-
-        # Move the reachable-vertex vector to host and store as an immutable set
-        ancestors_map[int(seed)] = frozenset(cp.asnumpy(reachable))
-
-    return ancestors_map
+    out: Dict[int, List[int]] = defaultdict(list)
+    for child, parent in zip(src_h, dst_h):
+        out[int(child)].append(int(parent))
+    return out
 
 
-# ---------------------------------------------------------------------------
+def _ancestors(cui: int, parent_index: Dict[int, List[int]]) -> FrozenSet[int]:
+    """Inclusive ancestor set of *cui*."""
+    visited: Set[int] = set()
+    stack: List[int] = [cui]
+    while stack:
+        v = stack.pop()
+        for p in parent_index.get(v, ()):
+            if p not in visited:
+                visited.add(p)
+                stack.append(p)
+    visited.add(cui)
+    return frozenset(visited)
+
+
+###############################################################################
 # Resnik helpers
-# ---------------------------------------------------------------------------
+###############################################################################
 
-def _mica_ic(ic_map: cp.ndarray, anc_a: FrozenSet[int], anc_b: FrozenSet[int]) -> float:
-    """Return IC of the most informative common ancestor (MICA).
-
-    *ic_map* is a CuPy array indexed by integer concept id.  Using a dense array
-    gives true O(1) lookup inside the GPU intersection kernel below.
-    """
+def _mica_ic(
+    ic_map: cp.ndarray,
+    anc_a: FrozenSet[int],
+    anc_b: FrozenSet[int],
+) -> float:
+    """Information content of the most informative common ancestor (MICA)."""
     common = anc_a & anc_b
     if not common:
         return 0.0
@@ -150,59 +151,65 @@ def _mica_ic(ic_map: cp.ndarray, anc_a: FrozenSet[int], anc_b: FrozenSet[int]) -
     return float(ic_map[idx].max())
 
 
-# ---------------------------------------------------------------------------
+###############################################################################
 # Public API
-# ---------------------------------------------------------------------------
+###############################################################################
 
-def resnik_bma(graph: cugraph.Graph,
-                    handle: cugraph.Graph,
-                    setA: Set[int],
-                    setB: Set[int],
-                    ic_map: cp.ndarray,
-                    *,
-                    graph_key: int = None) -> float:
-    """Compute Resnik Best‑Match Average (BMA) between *setA* and *setB*.
+def resnik_bma(
+    graph: cugraph.Graph,
+    setA: Set[int],
+    setB: Set[int],
+    ic_map: cp.ndarray,
+    *,
+    graph_key: int  = None,
+) -> float:
+    """Compute Resnik Best-Match Average (BMA) without BFS.
 
     Parameters
     ----------
-    graph, handle
-        The cuGraph graph object and its resource handle.
+    graph
+        cuGraph **directed** ontology graph (*child → parent*).
     setA, setB
         Sets of integer concept ids (e.g. CUIs).
     ic_map
-        Dense array mapping concept id ➜ information content.
+        Dense CuPy array mapping concept id → information content.
     graph_key
-        Optional stable identifier for *graph*; defaults to ``id(graph)``.  Use
-        this if you frequently rebuild the graph object but the topology is the
-        same (to leverage the cache).
+        Stable id for *graph*.  Defaults to ``id(graph)``; supply your own if
+        you rebuild the graph object frequently but the topology is unchanged.
     """
     if not setA or not setB:
         return 0.0
 
-    # ------------------------------------------------------------------
-    # 1. Ancestor cache (single GPU traversal for |A∪B| seeds)
-    # ------------------------------------------------------------------
-    seeds = tuple(sorted(setA | setB))
     key = graph_key if graph_key is not None else id(graph)
-    ancestor_map = _build_ancestor_cache(key, handle, graph, seeds)
+    if key not in _parent_index_cache:
+        _parent_index_cache[key] = _build_parent_index(graph)
+    parent_index = _parent_index_cache[key]
 
-    # ------------------------------------------------------------------
-    # 2. Vectorised best‑match max per row/col
-    # ------------------------------------------------------------------
-    def best_match(s1: Set[int], s2: Set[int]) -> cp.ndarray:
-        bm = cp.empty(len(s1), dtype=cp.float32)
-        for i, a in enumerate(s1):
-            # Compute IC scores against all *s2*; keep max
-            scores = cp.asarray([
-                _mica_ic(ic_map, ancestor_map[a], ancestor_map[b]) for b in s2
-            ], dtype=cp.float32)
+    # Per-call cache avoids repeated global LRU look-ups inside the hot loop
+    anc_cache: Dict[int, FrozenSet[int]] = {}
+
+    def ancestors(cui: int) -> FrozenSet[int]:
+        if cui in anc_cache:
+            return anc_cache[cui]
+        fs = _ancestors(cui, parent_index)
+        anc_cache[cui] = fs
+        return fs
+
+    def best_match(row: List[int], col: List[int]) -> cp.ndarray:
+        bm = cp.empty(len(row), dtype=cp.float32)
+        anc_col = [ancestors(b) for b in col]  # pre-gather
+        for i, a in enumerate(row):
+            anc_a = ancestors(a)
+            scores = cp.asarray(
+                [_mica_ic(ic_map, anc_a, anc_b) for anc_b in anc_col],
+                dtype=cp.float32,
+            )
             bm[i] = scores.max() if scores.size else 0.0
         return bm
 
-    scores_row = best_match(setA, setB)
-    scores_col = best_match(setB, setA)
-
-    return 0.5 * (scores_row.mean() + scores_col.mean())
+    scores_row = best_match(list(setA), list(setB))
+    scores_col = best_match(list(setB), list(setA))
+    return float(0.5 * (scores_row.mean() + scores_col.mean()))
 
 def bfs_level_dag(
     G: cugraph.Graph,
@@ -351,9 +358,9 @@ def construct_ic_graph_wrapper(mrhier_path, keep_cuis, max_expl_depth) -> ICGrap
 
     ic_scores = _intrinsic_ic(G)
 
-    sg, handle = knowledge_graph.graph_utils.construct_gpu_graph(G)
+    #sg, handle = knowledge_graph.graph_utils.construct_gpu_graph(G)
 
-    return ICGraphWrapper(sg, handle, ic_scores,
+    return ICGraphWrapper(G, None, ic_scores,
                           cui_to_vid=cui_to_vid,
                           vid_to_cui=vid_to_cui)
 

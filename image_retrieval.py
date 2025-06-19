@@ -1,7 +1,7 @@
 import argparse
 import sys
 from pathlib import Path
-from typing import Dict, Tuple, Union
+from typing import Dict, Tuple, Union, List
 import random
 import matplotlib.pyplot as plt
 
@@ -23,7 +23,7 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
                           retrieval_path: Union[str, Path],
                           balanced_path: Union[str, Path],
                           config_path: Union[str, Path],
-                          anomaly: str = "Consolidation") -> pd.DataFrame:
+                          anomalies: List[str]) -> pd.DataFrame:
 
     with open(config_path) as stream:
         config = yaml.safe_load(stream)
@@ -36,7 +36,7 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
     print(f"Score function: {config['retrieval_args']['cost_function']}")
     print(f"alpha: {config['hyperparameters']['alpha']}")
     print(f"beta: {config['hyperparameters']['beta']}")
-    print(f"Anomaly: {anomaly}")
+    print(f"Anomalies: {anomalies}")
     if config["retrieval_args"]["cost_function"] != "cosine_similarity":
         linker = ClinicalEntityLinker.from_default_constants()
     reports = []
@@ -44,13 +44,14 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
     df_retrieval = pd.read_csv(retrieval_path)
     df_balanced = pd.read_csv(balanced_path)
 
-    new_rows = df_balanced[
-        ~df_balanced['dicom_id'].isin(df_retrieval['dicom_id'])
-        & df_balanced['Finding Labels'].str.contains(anomaly, na=False)
-        ]
-    n_to_retrieve = len(new_rows)
-
-    df_retrieval = pd.concat([df_retrieval, new_rows], ignore_index=True)
+    new_rows_by_anom = {}
+    for anom in anomalies:
+        rows = df_balanced[
+            ~df_balanced['dicom_id'].isin(df_retrieval['dicom_id'])
+            & ~df_balanced['dicom_id'].isin(df_unbalanced['dicom_id'])
+            & df_balanced['Finding Labels'].str.contains(anom, na=False)]
+        new_rows_by_anom[anom] = rows
+        df_retrieval = pd.concat([df_retrieval, rows], ignore_index=True)
 
 
     retrieval_data = initialize_data(**config["init_data_args"], df=df_retrieval)
@@ -85,7 +86,8 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
                                 retrieval_data["ids"],
                                 linker,
                                 additional_cuis=additional_cuis)
-
+        reference_ids = retrieval_data["ids"].copy()
+        id_to_index_retrieval = dict(zip(reference_ids, list(range(len(reference_ids)))))
         retrieval_reports = wrapper.report_list.copy()
         neg_retrieval_reports = wrapper.neg_report_list.copy()
 
@@ -102,110 +104,158 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
                                                           config["hyperparameters"]["max_expl_depth"])
 
     add_data = []
-    df_anomaly = df_unbalanced[df_unbalanced[anomaly].fillna(False)]
-    data = initialize_data(**config["init_data_args"], df=df_anomaly)
-    batch_size = min(batch_size, len(data["reports"]))
-    acc_list = []
-    for start in range(0, n_to_retrieve, batch_size):
-        target_indices_anomaly = [(start + k) % len(data["reports"]) for k in range(batch_size)]
-        target_indices = list(df_anomaly.iloc[target_indices_anomaly].index)
-        if config["retrieval_args"]["cost_function"] == "cosine_similarity":
-            query_vec = embed_texts([data["reports"][i] for i in target_indices_anomaly],
-                                    tokenizer,
-                                    model,
-                                    config["hyperparameters"]["max_length"],
-                                    batch_size, "cuda")
-            scores, indices = knn(index, query_vec, config["hyperparameters"]["k"])
-            indices = [index for inner_indices in indices for index in inner_indices]
-            indices = np.asarray(indices)
-            index.remove_ids(indices)
+    # prepare per-anomaly unbalanced data
+    anomaly_data = {anom: initialize_data(**config["init_data_args"], df = df_unbalanced[df_unbalanced[anom].fillna(False)])
+                    for anom in anomalies}
+    # round-robin over anomalies until we've pulled all n_to_retrieve
+    # for each anomaly: a wrap-around pointer, and how many retrieves remain
+    ptr_counts = {anom: 0 for anom in anomalies}
+    remaining_counts = {anom: len(new_rows_by_anom[anom]) for anom in anomalies}
+    acc_list = {anom: [] for anom in anomalies}
 
-            add_data.append(df_retrieval[image_path_column].iloc[indices])
-            reports.append((indices[0], df_retrieval[report_column].iloc[indices].values[0]))
-            acc = get_accuracy(df_retrieval, [report[0] for report in reports], anomaly)
-            acc_list.append(acc)
-            sys.stdout.write("\rAccuracy %f Length %i" % (acc, len(reports)))
-            sys.stdout.flush()
-        else:
-            mapped_reports = []
-            mapped_neg_reports = []
-            mapped_targets = []
-            mapped_neg_targets = []
-            for idx in target_indices:
-                target_curr = unbalanced_reports[idx]
-                neg_target_curr = neg_unbalanced_reports[idx]
-                mapped_reports.append((unbalanced_data["ids"][idx], retrieval_reports))
-                mapped_neg_reports.append((unbalanced_data["ids"][idx], neg_retrieval_reports))
-                mapped_targets.append((unbalanced_data["ids"][idx], target_curr))
-                mapped_neg_targets.append((unbalanced_data["ids"][idx], neg_target_curr))
+    # keep going until we've done exactly `remaining_counts[anom]` retrieves per anomaly
+    while sum(remaining_counts.values()) > 0:
+        for anom in anomalies:
+            if remaining_counts[anom] == 0:
+                continue
+            # pick one original report in wrap-around fashion
+            rpt_list = anomaly_data[anom]["reports"]
+            ptr = ptr_counts[anom] % len(rpt_list)
+            ptr_counts[anom] += 1
+            remaining_counts[anom] -= 1
 
-            sg, handle = construct_gpu_graph(wrapper.graph)
+            # get the DataFrame index of that unbalanced example
+            idx = df_unbalanced[df_unbalanced[anom].fillna(False)].index[ptr]
+            target_indices = [idx]
 
-            results = k_closest_reference_reports(
-                handle,
-                sg,
-                wrapper.cui_to_vid,
-                wrapper.vid_to_cui,
-                mapped_reports,
-                mapped_targets,
-                wrapper.set_to_id,
-                alpha=config["hyperparameters"]["alpha"],
-                beta=config["hyperparameters"]["beta"],
-                k=config["hyperparameters"]["k"],
-                cost_function=config["retrieval_args"]["cost_function"],
-                max_depth=config["hyperparameters"]["max_expl_depth"],
-                linker=linker,
-                ic_graph_wrapper=ic_graph_wrapper,
-                graph_wrapper=wrapper,
-                ids_to_index=wrapper.id_to_index,
-                neg_target=mapped_neg_targets,
-                neg_reference_reports=mapped_neg_reports,
-                neg_set_to_ids = wrapper.neg_set_to_id
-            )
-
-
-            mapped_indices = topk_indices(results, wrapper.id_to_index, k=config["hyperparameters"]["k"])
-            for target_idx in target_indices:
-                indices = mapped_indices[unbalanced_data["ids"][target_idx]]
-                add_data.append(df_retrieval[image_path_column].iloc[indices])
+            if config["retrieval_args"]["cost_function"] == "cosine_similarity":
+                query_vec = embed_texts([anomaly_data[anom]["reports"][ptr]],
+                                        tokenizer,
+                                        model,
+                                        config["hyperparameters"]["max_length"],
+                                        batch_size, "cuda")
+                scores, indices = knn(index, query_vec, config["hyperparameters"]["k"])
+                indices = [index for inner_indices in indices for index in inner_indices]
+                indices = np.asarray(indices)
+                index.remove_ids(indices)
+                add_data.append((anom, df_retrieval[image_path_column].iloc[indices]))
                 reports.append((indices[0], df_retrieval[report_column].iloc[indices].values[0]))
-                acc = get_accuracy(df_retrieval, [report[0] for report in reports], anomaly)
-                acc_list.append(acc)
-                sys.stdout.write("\rAccuracy %f Length %i" % (acc, len(reports)))
+                acc = get_accuracy(df_retrieval, [r[0] for r in reports], anom)
+                acc_list[anom].append(acc)
+                sys.stdout.write("\rAnomaly %s Accuracy %f Length %i" % (anom, acc, len(reports)))
                 sys.stdout.flush()
-                used_ids = {df_retrieval.iloc[i][id_column] for i in indices}
-                retrieval_reports = [report for report in retrieval_reports if len(set(wrapper.set_to_id
-                [report]) & used_ids) == 0]
+            else:
+                mapped_reports = []
+                mapped_neg_reports = []
+                mapped_targets = []
+                mapped_neg_targets = []
+                for idx in target_indices:
+                    target_curr = unbalanced_reports[idx]
+                    neg_target_curr = neg_unbalanced_reports[idx]
+                    mapped_reports.append((unbalanced_data["ids"][idx], retrieval_reports))
+                    mapped_neg_reports.append((unbalanced_data["ids"][idx], neg_retrieval_reports))
+                    mapped_targets.append((unbalanced_data["ids"][idx], target_curr))
+                    mapped_neg_targets.append((unbalanced_data["ids"][idx], neg_target_curr))
+
+                sg, handle = construct_gpu_graph(wrapper.graph)
+
+                results = k_closest_reference_reports(
+                    handle,
+                    sg,
+                    wrapper.cui_to_vid,
+                    wrapper.vid_to_cui,
+                    mapped_reports,
+                    mapped_targets,
+                    wrapper.set_to_id,
+                    alpha=config["hyperparameters"]["alpha"],
+                    beta=config["hyperparameters"]["beta"],
+                    k=config["hyperparameters"]["k"],
+                    cost_function=config["retrieval_args"]["cost_function"],
+                    max_depth=config["hyperparameters"]["max_expl_depth"],
+                    linker=linker,
+                    ic_graph_wrapper=ic_graph_wrapper,
+                    graph_wrapper=wrapper,
+                    ids_to_index=id_to_index_retrieval,
+                    neg_target=mapped_neg_targets,
+                    neg_reference_reports=mapped_neg_reports,
+                    neg_set_to_ids = wrapper.neg_set_to_id,
+                    allow_empty_references=True
+                )
 
 
-    for image_path in add_data:
-        df_unbalanced.loc[len(df_unbalanced), ['path', 'Finding Labels']] = [image_path.values[0], anomaly]
+                mapped_indices = topk_indices(results, wrapper.id_to_index, k=config["hyperparameters"]["k"])
+                for target_idx in target_indices:
+                    indices = mapped_indices[unbalanced_data["ids"][target_idx]]
+                    add_data.append((anom, df_retrieval[image_path_column].iloc[indices]))
+                    reports.append((indices[0], df_retrieval[report_column].iloc[indices].values[0]))
+                    #print(reports[-1])
+                    acc = get_accuracy(df_retrieval, [report[0] for report in reports], anom)
+                    acc_list[anom].append(acc)
+                    sys.stdout.write("\rAnomaly %s Accuracy %f Length %i" % (anom, acc, len(reports)))
+                    sys.stdout.flush()
+                    used_ids = {df_retrieval.iloc[i][id_column] for i in indices}
+                    for report in list(wrapper.set_to_id):  # snapshot of keys
+                        ids = wrapper.set_to_id[report]
+                        remaining = [i for i in ids if i not in used_ids]  # keep good IDs
+
+                        if remaining:
+                            wrapper.set_to_id[report] = remaining  # shrink in-place
+                        else:
+                            wrapper.set_to_id.pop(report)  # drop empty entry
+
+                    retrieval_reports = [r for r in retrieval_reports
+                                         if r in wrapper.set_to_id]
+
+                    for report in list(wrapper.neg_set_to_id):  # snapshot of keys
+                        ids = wrapper.neg_set_to_id[report]
+                        remaining = [i for i in ids if i not in used_ids]  # keep good IDs
+
+                        if remaining:
+                            wrapper.neg_set_to_id[report] = remaining  # shrink in-place
+                        else:
+                            wrapper.neg_set_to_id.pop(report)  # drop empty entry
+
+                    neg_retrieval_reports = [r for r in neg_retrieval_reports
+                                         if r in wrapper.neg_set_to_id]
+
+                    reference_ids = list(set(reference_ids) - used_ids)
+
+
+                    id_to_index_retrieval = dict(zip(reference_ids, list(range(len(reference_ids)))))
+                    #retrieval_reports = [report for report in retrieval_reports if len(set(wrapper.set_to_id
+                    #[report]) & used_ids) == 0]
+
+
+    for anom, image_path in add_data:
+        df_unbalanced.loc[len(df_unbalanced), ['path', 'Finding Labels']] = [image_path.values[0], anom]
     if config["retrieval_args"]["cost_function"] == "cosine_similarity":
         model_name = config["cosine_similarity"]["type"]
     else:
         model_name = "No"
-    plt.yticks(np.arange(0, 1, 0.05))
-    plt.plot(acc_list)
+    #plt.yticks(np.arange(0, 1, 0.05))
+    #plt.plot(acc_list)
 
-    if config['retrieval_args']['cost_function'] in ["umls", "tversky"]:
-        stem = (
-            f"metric={config['retrieval_args']['cost_function']}_"
-            f"a={config['hyperparameters']['alpha']}_"
-            f"b={config['hyperparameters']['beta']}_"
-            f"model={model_name}_{anomaly}_{config['output_suffix']}"
-        )
+    anomalies_stem = "_".join(anomalies)
+    if config['retrieval_args']['cost_function'] in ["umls", "tversky", "sym_tversky"]:
+       stem = (f"metric={config['retrieval_args']['cost_function']}_"
+               f"a={config['hyperparameters']['alpha']}_"
+               f"b={config['hyperparameters']['beta']}_"
+               f"model={model_name}_{anomalies_stem}_{config['output_suffix']}")
     else:
-        stem = (
-            f"metric={config['retrieval_args']['cost_function']}_"
-            f"model={model_name}_{config['output_suffix']}"
-        )
+        stem = (f"metric={config['retrieval_args']['cost_function']}_"f"model={model_name}_{anomalies_stem}_{config['output_suffix']}")
 
+    # save per‐anomaly accuracy table
+    df_acc = pd.DataFrame({anom: pd.Series(vals)
+                           for anom, vals in acc_list.items()})
+    df_acc.to_csv(
+        f"{config['output_dir']}acc_list_{anomalies_stem}.csv",
+        index=False
+    )
 
+    # save the updated unbalanced set
     df_unbalanced.to_csv(f"{config['output_dir']}{stem}.csv", index=False)
 
-    plt.savefig(f"{stem}_plot.png")
-
-    pd.Series(acc_list).to_csv(f"{config['output_dir']}acc_list_{stem}.csv", index=False)
+    #plt.savefig(f"{stem}_plot.png")
 
     return df_unbalanced
 
@@ -226,17 +276,17 @@ def parse_args():
     return parser.parse_args()
 
 if __name__ == "__main__":
-    anomaly = "Consolidation"
+    anomalies = ["Atelectasis", "Cardiomegaly", "Consolidation", "Edema", "No Finding", "Pleural Effusion", "Pneumonia", "Pneumothorax"]
     args = parse_args()
     if args.config_path is not None:
         config_path = args.config_path
     else:
-        config_path = f"/vol/ideadata/ce90tate/knowledge_graph_distance/configs/config_{anomaly}.yml"
+        config_path = f"/vol/ideadata/ce90tate/knowledge_graph_distance/configs/config.yml"
 
-    df_filled = fill_low_tail_classes(f"/vol/ideadata/ce90tate/knowledge_graph_distance/splits/longtail_8_train_unbalanced_{anomaly}.csv",
+    df_filled = fill_low_tail_classes(f"/vol/ideadata/ce90tate/knowledge_graph_distance/splits/longtail_8_train_unbalanced_Atelectasis.csv",
                           f"/vol/ideadata/ce90tate/knowledge_graph_distance/splits/longtail_8_balanced_retrieve.csv",
                                       "/vol/ideadata/ce90tate/knowledge_graph_distance/splits/longtail_8_balanced_train.csv",
-                          config_path, anomaly=anomaly)
+                          config_path, anomalies=anomalies)
 
 
 

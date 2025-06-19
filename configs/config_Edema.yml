@@ -1,7 +1,7 @@
-output_dir: "/vol/ideadata/ce90tate/knowledge_graph_distance/retrieved/"
-output_suffix: "edema.csv"
-mentions_path: "/vol/ideadata/ce90tate/data/umls/mentions_mimic_lt_Edema_train_retrieval_snomed.pkl"
-retrieval_mentions_path: "/vol/ideadata/ce90tate/data/umls/mentions_8_balanced_retrieve_retrieval_snomed.pkl"
+output_dir: "/vol/ideadata/ce90tate/knowledge_graph_distance/retrieved_consistent/"
+output_suffix: "Edema_final"
+mentions_path: "/vol/ideadata/ce90tate/data/umls/mentions_mimic_lt_Edema_train_retrieval_top128_final.pkl"
+retrieval_mentions_path: "/vol/ideadata/ce90tate/data/umls/mentions_8_balanced_retrieve_retrieval_sents_mixed.pkl"
 mrrel_path: "/vol/ideadata/ce90tate/data/umls/2024AB/META/MRREL.RRF"
 mrhier_path: "/vol/ideadata/ce90tate/data/umls/2024AB/META/MRHIER.RRF"
 
@@ -13,20 +13,20 @@ init_data_args:
 
 retrieval_args:
   use_ic: False
-  cost_function: umls
+  cost_function: sym_tversky
 
 hyperparameters:
   k: 1
   max_expl_depth: 10
-  alpha: 1
+  alpha: 0.5
   beta: 1
 
   batch_size: 1
   max_length: 77
 
 cosine_similarity:
-  type: cxr-bert
-  model: microsoft/BiomedVLP-CXR-BERT-specialized
-  subfolder: false
-  index_path: /vol/ideadata/ce90tate/data/faiss/ss/cxr-bert_snomed.index
+  type: clip
+  model: stabilityai/stable-diffusion-2
+  subfolder: text_encoder
+  index_path: /vol/ideadata/ce90tate/data/faiss/ss/clip_snomed.index
 
