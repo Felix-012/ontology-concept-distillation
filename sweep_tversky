@@ -22,7 +22,7 @@ set -euo pipefail
 
 # ─── defaults ────────────────────────────────────────────────────────────────
 ENV_NAME="${CONDA_DEFAULT_ENV:-}"
-BASE_CONFIG="/vol/ideadata/ce90tate/knowledge_graph_distance/configs/config_Consolidation_sweep.yml"
+BASE_CONFIG="/vol/ideadata/ce90tate/knowledge_graph_distance/configs/config_Atelectasis_sweep.yml"
 OUT_DIR="tmp_configs"
 
 # ─── CLI parsing ─────────────────────────────────────────────────────────────
@@ -42,8 +42,8 @@ export PYTHONPATH=$PWD
 mkdir -p "$OUT_DIR"
 
 # ─── sweep grid ──────────────────────────────────────────────────────────────
-ALPHAS=(1.0 0.9 0.75 0.6 0.5 0.4 0.25 0.1 0.0)
-BETAS=( 0.0 0.1 0.25 0.4 0.5 0.6 0.75 0.9 1.0)
+ALPHAS=(1.0 0.9 0.75 0.5 0.4 0.1 0.0)
+BETAS=( 1 1 1 1 1 1 1 1 1)
 
 
 for i in "${!ALPHAS[@]}"; do
