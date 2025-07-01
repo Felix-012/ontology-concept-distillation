@@ -34,18 +34,6 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import pandas as pd
 
-# -----------------------------------------------------------------------------
-# Regex to parse filenames
-# -----------------------------------------------------------------------------
-FILENAME_RE = re.compile(
-    r"acc_list_metric=(?P<metric>[^_]+(?:_[^_]+)*?)"        # metric (underscores ok)
-    r"(?:_a=(?P<a>[^_]+)_b=(?P<b>[^_]+))?"                 # optional a & b
-    r"_model=(?P<model>[^_]+(?:_[^_]+)*?)"                 # model (underscores ok)
-    r"_(?P<disease>[^_]+)"                                 # disease
-    r"(?:_(?P<suffix>[^.]+))?"                             # optional suffix
-    r"\.csv$"
-)
-
 mpl.rcParams.update({
     "figure.dpi": 150,
     "font.size": 10,
@@ -54,17 +42,6 @@ mpl.rcParams.update({
 # -----------------------------------------------------------------------------
 # Helper functions
 # -----------------------------------------------------------------------------
-
-def parse_filename(path: Path) -> dict[str, str | None]:
-    """Extract metadata from *path* according to ``FILENAME_RE``."""
-    m = FILENAME_RE.match(path.name)
-    if not m:
-        raise ValueError(f"Filename '{path.name}' does not match required pattern.")
-    info = m.groupdict()
-    info.setdefault("a", None)
-    info.setdefault("b", None)
-    return info
-
 
 def load_series(path: Path) -> pd.Series:
     """Load a single‑column CSV and return it as a ``pd.Series`` of floats."""
@@ -82,34 +59,17 @@ def make_label(meta: dict[str, str | None]) -> str:
     # If model is literally "No", use only the disease string
     return str(meta["disease"]).replace("_", " ")
 
-# -----------------------------------------------------------------------------
-# File discovery
-# -----------------------------------------------------------------------------
-
-def discover_csvs(paths: Iterable[Path], recursive: bool) -> List[Path]:
-    csvs: list[Path] = []
-    for p in paths:
-        if any(ch in str(p) for ch in "*?["):
-            csvs.extend(p.parent.glob(p.name))
-            continue
-        if p.is_dir():
-            csvs.extend(p.rglob("*.csv") if recursive else p.glob("*.csv"))
-        elif p.is_file():
-            csvs.append(p)
-        else:
-            print(f"⚠️ Warning: {p} not found", file=sys.stderr)
-    return sorted(csvs)
-
-# -----------------------------------------------------------------------------
-# Plotting
-# -----------------------------------------------------------------------------
 
 def plot_all(
-    entries: List[Tuple[dict[str, str | None], pd.Series]],
+    entries: list[tuple[dict[str, str | None], pd.Series]],
     outdir: Path,
     stem: str = "accuracy_combined",
     dark: bool = False,
 ) -> None:
+    """
+    Plot multiple accuracy curves.  When two final points overlap in y,
+    only annotate the curve whose final x is largest (right-most).
+    """
     if not entries:
         raise ValueError("No series to plot.")
 
@@ -120,32 +80,35 @@ def plot_all(
         ax.spines[spine].set_visible(False)
 
     ax.tick_params(left=False, bottom=False)
-    annotated_y = []
-    y_tol = 0.02  # “too close” threshold (in data units, tweak as needed)
-    # ------------------------------------------
+    annotated: dict[float, tuple[float, str]] = {}  # y → (x, text)
+    y_tol = 0.02  # “too close” threshold in data units
 
-    for meta, series in entries:
+    # ------------------------------------------------------------------
+    # 1.  Draw all curves first, remembering their last points.
+    #     Sort DESC by length so the right-most curve is handled first.
+    # ------------------------------------------------------------------
+    last_pts: list[tuple[dict[str, str | None], float, float]] = []
+    for meta, series in sorted(entries, key=lambda e: len(e[1]), reverse=True):
         ax.plot(series.index, series.values, marker=".", label=make_label(meta))
+        last_pts.append((meta, series.index[-1], series.values[-1]))
 
-        # last point
-        last_x = series.index[-1]
-        last_y = series.values[-1]
+    # ------------------------------------------------------------------
+    # 2.  Annotate, preferring the right-most (already ordered that way).
+    # ------------------------------------------------------------------
+    for meta, last_x, last_y in last_pts:
+        if any(abs(last_y - y0) < y_tol for y0 in annotated):
+            continue  # a longer series at ~this y already claimed the label
 
-        # decide offset: default → right; if too close → left
-        offset = (4, 0)  # 4 px to the right
-        if any(abs(last_y - y0) < y_tol for y0 in annotated_y):
-            continue
-
+        offset = (4, 0)  # 4 px to the right of the point
         ax.annotate(f"{last_y:.0%}",
                     (last_x, last_y),
                     xytext=offset,
                     textcoords="offset points",
-                    va="center", ha="left" if offset[0] > 0 else "right",
+                    va="center", ha="left",
                     fontsize=8)
+        annotated[last_y] = (last_x, f"{last_y:.0%}")
 
-        annotated_y.append(last_y)  # remember position for next curves
-
-    ax.set_title("MIMIC-CXR Label Accuracy per Retrieval (Jaccard)")
+    ax.set_title("MIMIC-CXR Label Accuracy per Retrieval (Ours Prototypical)")
     ax.set_xlabel("Number of Retrievals")
     ax.set_ylabel("Accuracy")
     ax.set_ylim(0, 1)
@@ -158,58 +121,48 @@ def plot_all(
         fig.savefig(outdir / f"{stem}.{ext}")
     plt.close(fig)
 
-# -----------------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------------
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=textwrap.dedent(
-            """
-            Combine accuracy‑over‑time curves from CSV files into one plot.
 
-            Positional *paths* may be directories, individual CSV files, or globs. All
-            matching CSVs are plotted in a single figure. Use `--recursive` to search
-            sub‑folders.
-            """
-        ),
-    )
+# Fallback in case you don’t already have one.
+def make_label(meta: dict[str, str | None]) -> str:
+    """Simple label builder: use the disease name, plus any extra info."""
+    disease = meta.get("disease", "unknown")
+    extra   = meta.get("extra", "")
+    return f"{disease} {extra}".strip()
 
-    parser.add_argument("paths", nargs="+", type=Path, help="Input directories/files/globs.")
-    parser.add_argument("-o", "--outdir", type=Path, default=Path("plots"), help="Output directory.")
-    parser.add_argument("--recursive", action="store_true", help="Recursively search directories.")
-    parser.add_argument("--dark", action="store_true", help="Use dark theme for the plot.")
-    return parser
+# ------------------------------------------------------------------
 
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
-
-def main(argv: list[str] | None = None) -> None:
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
-
-    csv_paths = discover_csvs(args.paths, recursive=args.recursive)
-    if not csv_paths:
-        parser.error("No CSV files found matching provided paths.")
-
+def build_entries(df: pd.DataFrame) -> List[Tuple[dict[str, str | None], pd.Series]]:
+    """
+    Convert every column of `df` into the (meta, series) tuples
+    that `plot_all` expects.
+    """
     entries: List[Tuple[dict[str, str | None], pd.Series]] = []
-    for path in csv_paths:
-        try:
-            meta = parse_filename(path)
-            series = load_series(path)
-        except ValueError as e:
-            print(f"⚠️ Skipping {path}: {e}", file=sys.stderr)
-            continue
+
+    for col in df.columns:
+        # Drop NaNs so ragged columns are OK.
+        series = df[col].dropna()
+
+        # Re-index 1, 2, … so the x-axis is “retrieval #”.
+        series.index = range(1, len(series) + 1)
+
+        meta = {"disease": col}
         entries.append((meta, series))
 
-    if not entries:
-        parser.error("No valid CSVs matched the naming pattern.")
+    return entries
 
-    plot_all(entries, args.outdir, dark=args.dark)
-    print(f"✅ Combined plot saved to '{args.outdir.resolve()}'")
+
+def main(csv_path: Path, outdir: Path, stem: str, dark: bool) -> None:
+    df = pd.read_csv(csv_path)
+    entries = build_entries(df)
+
+    # Hand off to your existing plotting helper.
+    plot_all(entries, outdir, stem=stem, dark=dark)
+    print(f"✓ Plots written to {outdir / (stem + '.png')} and .pdf")
 
 
 if __name__ == "__main__":
-    main()
+    main(Path("/vol/ideadata/ce90tate/knowledge_graph_distance/retrieved_final/acc_list_metric=sym_tversky_a=0_b=1_model=No_Atelectasis_Cardiomegaly_Consolidation_Edema_No Finding_Pleural Effusion_Pneumonia_Pneumothorax_all_anomalies.csv"),
+         Path("/vol/ideadata/ce90tate/knowledge_graph_distance/plots/"),
+         "tverskyfinal",
+         False)

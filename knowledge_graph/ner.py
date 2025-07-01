@@ -1,4 +1,6 @@
 import json
+from itertools import combinations
+
 import spacy
 import pickle
 from dataclasses import asdict, dataclass
@@ -40,8 +42,202 @@ LABELS = ["Atelectasis",
           "Pneumothorax",
           "Opacity",
           "Device",
-          "Fracture"
+          "Fracture",
+          "Pleural",
+          "Lesion"
           ]
+
+CUIS = [
+    frozenset(["C0004144"]),
+    frozenset(["C0018800"]),
+    frozenset(["C0521530"]),
+    frozenset(["C0013604"]),
+    frozenset(["C0032227"]),
+    frozenset(["C0032285"]),
+    frozenset(["C5921295"]),
+    frozenset(["C0025080"]),
+    frozenset(["C0016658"]),
+    frozenset()                 # the empty set we’ll drop
+]
+
+CUI_TO_LABEL = {"C0004144": "Atelectasis",
+                "C0018800": "Cardiomegaly",
+                "C0521530": "Consolidation",
+                "C0013604": "Pleural Effusion",
+                "C0032227": "Pneumonia",
+                "C0032285": "Pneumothorax",
+                "C5921295": "Opacity",
+                "C0025080": "Device",
+                "C0016658": "Fracture",
+                frozenset(): "No Finding"
+                }
+
+LABEL_TO_CUI = {
+    "Atelectasis": {"C0004144"},
+    "Cardiomegaly": {"C0018800"},
+    "Enlarged Cardiomediastinum": {"C0018800"},
+    "Consolidation": {"C0521530"},
+    "Edema": {"C0013604"},
+    "Pleural Effusion": {'C0032227'},
+    "Pleural Other": {"C0348709"},
+    "Pneumonia": {"C0032285"},
+    "Pneumothorax": {"C0032326"},
+    "Lung Opacity": {"C5921295"},
+    "Support Devices": {"C0025080", },
+    "Fracture": {"C0016658"},
+    "Lung Lesion": {"C0577916"},
+    "No Finding": frozenset()
+}
+
+PHRASES = {"Atelectasis": ["atelectasis", "atelecta", "collapse"],
+           "Cardiomegaly": ["cardiomegaly", "the heart", "heart size", "cardiac enlargement", "cardiac size", "cardiac shadow",
+                            "cardiac contour", "cardiac silhouette", "enlarged heart"],
+           "Consolidation": ["consolidation", "consolidat"],
+           "Edema": ["edema", "heart failure", "chf", "vascular congestion", "pulmonary congestion", "indistinctness", "vascular prominence"],
+           "Fracture": ["fracture"],
+           "Lesion": [
+               "lesion",
+               "mass",
+               "nodular density",
+               "nodular densities",
+               "nodular opacity",
+               "nodular opacities",
+               "nodular opacification",
+               "nodule",
+               "lump",
+               "cavitary lesion",
+               "carcinoma",
+               "neoplasm",
+               "tumor",
+           ],
+           "Opacity": [
+               "opacity",
+               "opaci",
+               "decreased translucency",
+               "increased density",
+               "airspace disease",
+               "air-space disease",
+               "air space disease",
+               "infiltrate",
+               "infiltration",
+               "interstitial marking",
+               "interstitial pattern",
+               "interstitial lung",
+               "reticular pattern",
+               "reticular marking",
+               "reticulation",
+               "parenchymal scarring",
+               "peribronchial thickening",
+               "wall thickening",
+               "scar",
+           ],
+           "No Finding": [
+               "emphysema",
+               "blunt",
+               "density",
+               "elevation",
+               "eventration",
+               "scoliosis",
+               "degenera",
+               "calcifi",
+               "hyperinflation",
+               "bronchospasm",
+               "asthma",
+               "hernia",
+               "copd",
+               "interstitial markings",
+               "plaque",
+               "osteophytosis",
+               "aortic disease",
+               "bronchiolitis",
+               "airways disease",
+               "thickening",
+               "cephalization",
+               "aspiration",
+               "bullae",
+               "hyperinflat",
+               "contusion",
+               "atherosclero",
+               "osteopenia",
+               "metastasis",
+               "granuloma",
+               "pneumomediastinum",
+               "pneumoperitoneum",
+               "osteodystrophy",
+               "cuffing",
+               "irregular lucency",
+               "inflam",
+               "fissure",
+               "hypertension",
+               "prominen",
+               "kyphosis",
+               "defib",
+               "hyperexpansion",
+               "bullet",
+               "reticula",
+               "thoracentesis",
+               "bronchitis",
+               "volume loss",
+               "deformity",
+               "hemorrhage",
+               "hematoma",
+               "radiopaque",
+               "aerophagia",
+               "arthropathy",
+               "tracheostomy",
+           ],
+           "Effusion": [
+               "pleural effusion",
+               "pleural fluid",
+               "effusion",
+           ],
+           "Pleural": [
+               "pleural thickening",
+               "fibrosis",
+               "fibrothorax",
+               "pleural scar",
+               "pleural parenchymal scar",
+               "pleuro-parenchymal scar",
+               "pleuro-pericardial scar",
+           ],
+           "Pneumonia": [
+               "pneumonia",
+               "infection",
+               "infectious process",
+               "infectious",
+           ],
+           "Pneumothorax": [
+               "pneumothorax",
+               "pneumothoraces",
+           ],
+           "Device": [
+               "pacer",
+               "_line_",
+               "lines",
+               "picc",
+               "tube",
+               "valve",
+               "catheter",
+               "pacemaker",
+               "hardware",
+               "arthroplast",
+               "marker",
+               "icd",
+               "defib",
+               "device",
+               "drain_",
+               "plate",
+               "screw",
+               "cannula",
+               "apparatus",
+               "coil",
+               "support",
+               "equipment",
+               "mediport",
+           ],
+           }
+
+PRECEDENCE = {"present": 2, "uncertain": 1, "absent": 3}
 
 @dataclass
 class Span:
@@ -462,8 +658,6 @@ class ClinicalEntityLinker:
         Returns one of: "present", "uncertain", "absent".
         """
         words = note.lower().split()
-        if len(words) < 4:
-            raise ValueError("Input note must be at least 4 words")
 
         # Define your trigger keywords (customize these lists as needed)
         ABSENCE_KEYWORDS = {"no", "not", "none", "without", "absent"}
@@ -533,38 +727,251 @@ def _load_mrdef(mrsty_path: Union[str, Path]) -> Dict[str, str]:
 
 
 
-def create_labels(ids, mentions, linker):
+from collections import defaultdict
+
+def create_labels(ids, mentions, linker, reports, thresh=0):
+    """
+    Parameters
+    ----------
+    thresh : float, optional
+        Study-level decision threshold on the aggregated probability.
+        • 0.0 reproduces CheXpert semantics (“any evidence counts”).
+        • 0.3–0.5 trades a bit of recall for higher precision.
+    """
+    label_dict = {}
+
+    for study_id, mentions_per_report, report in zip(ids, mentions, reports):
+        # ────────────────── per-study accumulators ──────────────────────────
+        doc_scores     = defaultdict(float)                # noisy-OR prob per label
+        best_assertion = {lbl: "absent" for lbl in LABELS} # highest-precedence assert
+
+        # ────────────────── scan all mentions ───────────────────────────────
+        for m in mentions_per_report:
+            evidence_found = False  # track whether we had a direct match
+
+            # ---------- 1. direct label ↔ CUI string match -------------------
+            for lbl in LABELS:
+                s_text = (m.score_text
+                          if lbl.lower() in linker.cui2str.get(m.cui_text, "").lower()
+                          else 0.0)
+                s_surf = (m.score_surface
+                          if lbl.lower() in linker.cui2str.get(m.cui_surface, "").lower()
+                          else 0.0)
+                score = max(s_text, s_surf)
+
+
+                if score != 0 and m.assertion == "absent":
+                    score = -1
+                if score != 0 and  m.assertion == "present":
+                    score = 1
+
+                # --- aggregate ------------------------------------------------------------
+                if score != 0:
+                    evidence_found = True               # clamp to [0,1]
+                    # noisy-OR aggregation: p_total = 1 − ∏(1 − p_i)
+                    doc_scores[lbl] += score
+
+                    # keep strongest assertion
+                    if PRECEDENCE[m.assertion] > PRECEDENCE[best_assertion[lbl]]:
+                        best_assertion[lbl] = m.assertion
+
+                    # optional diagnostics
+                    if m.assertion == "present":
+                        surf = " ".join(m.mods + [m.text]).strip()
+                        print(f"{surf}: {lbl} {score}")
+
+            # ---------- 2. broader-CUI fallback (only if 1. had no hits) -----
+            if not evidence_found:
+                broader_surf = set(linker.relations.get(m.cui_surface, []) or [])
+                broader_text = set(linker.relations.get(m.cui_text,   []) or [])
+                for broad_cui in broader_surf | broader_text:
+                    cui_str = linker.cui2str.get(broad_cui, "").lower()
+                    for lbl in LABELS:
+                        if lbl.lower() in cui_str:
+                            doc_scores[lbl] += 1
+
+                            if PRECEDENCE[m.assertion] > PRECEDENCE[best_assertion[lbl]]:
+                                best_assertion[lbl] = m.assertion
+
+                            # optional diagnostics
+                            if m.assertion == "present":
+                                surf = " ".join(m.mods + [m.text]).strip()
+                                print(f"Broad: {surf}: {lbl} "
+                                      f"{m.score_text} {m.score_text}")
+
+        # ────────────────── final study-level decision ───────────────────────
+        label_dict[study_id] = set()
+        for lbl, prob in doc_scores.items():
+            if prob > thresh:
+                label_dict[study_id].add((lbl, best_assertion[lbl]))
+
+        # ---- default “No Finding” if absolutely nothing triggered ----------
+        if not label_dict[study_id]:
+            label_dict[study_id].add(("No Finding", "present"))
+
+    return label_dict
+
+
+def jaccard_label(report_cuis, label_cuis):
+    sim = len(label_cuis & report_cuis) / len(label_cuis | report_cuis) if (label_cuis | report_cuis) else 0
+    return sim
+
+def macro_jaccard(report_cuis, label_cui_sets):
+    if not label_cui_sets:  # no candidate labels → no overlap
+        return 0.0
+
+    sims = []
+    for label in label_cui_sets:
+        union = report_cuis | label_cui_sets[label]
+        sims.append(len(report_cuis & label_cui_sets[label]) / len(union) if union else 0.0)
+
+    return sum(sims) / len(sims)
+
+def coverage_score(report_cuis, label_cuis):
+    if not report_cuis:          # edge case: empty report
+        return 1.0               # treat as perfectly covered
+    hits = len(report_cuis & label_cuis)
+    return hits / len(report_cuis)
+
+
+def create_labels_sim(ids, mentions, linker, all_combos):
     label_dict = {}
     for id, mentions_per_report in zip(ids, mentions):
         label_dict[id] = set()
+        cui_set = set()
         for mention in mentions_per_report:
-            has_label = False
-            for label in LABELS:
-                if label.lower() in linker.cui2str[mention.cui_text].lower() or \
-                    label.lower() in linker.cui2str[mention.cui_surface].lower():
-                    label_dict[id].add((label, mention.assertion))
-                    has_label = True
-            if not has_label:
-                for label in LABELS:
-                    broader_surf = linker.relations.get(mention.cui_surface)
-                    broader_text = linker.relations.get(mention.cui_text)
-                    if broader_surf is None:
-                        broader_surf = set()
-                    else:
-                        broader_surf = set(broader_surf)
-                    if broader_text is None:
-                        broader_text = set()
-                    else:
-                        broader_text = set(broader_text)
-                    broader = broader_surf | broader_text
-
-                    for broad in broader:
-                        if label.lower() in linker.cui2str.get(broad, "").lower():
-                            label_dict[id].add((label, mention.assertion))
-
-        if len(label_dict[id]) == 0:
-            label_dict[id] = {("No Finding", "present")}
+            cui_set.add(mention.cui_text)
+            cui_set.add(mention.cui_surface)
+        label_cuis = jaccard_label(cui_set, all_combos)
+        labels = [CUI_TO_LABEL[label_cui] for label_cui in label_cuis]
+        label_dict[id] = label_dict[id] | set(labels)
+        print(f"{' '.join([mention.text for mention in mentions_per_report]).strip() }: {label_dict[id]}")
     return label_dict
+
+def choose_label(mentions, labels1, labels2, linker):
+    label1_ctr = label2_ctr = inter_ctr = union_ctr = 0
+    ret_labels = []
+    label_dict        = populate_labels(mentions, linker)
+
+    labels1_cuis_all  = _labels_to_cuis(labels1, label_dict)
+    labels2_cuis_all  = _labels_to_cuis(labels2, label_dict)
+
+    for m_rpt, lbl1_str, lbl2_str, cuis1_set, cuis2_set in zip(
+            mentions, labels1, labels2, labels1_cuis_all, labels2_cuis_all):
+
+        cui_present = {
+            m.cui_text    for m in m_rpt if m.assertion == "present"
+        } | {
+            m.cui_surface for m in m_rpt if m.assertion == "present"
+        }
+        lbl1_tokens = [t for t in lbl1_str.split('|') if t]
+        lbl2_tokens = [t for t in lbl2_str.split('|') if t]
+        inter_tokens = [t for t in lbl1_tokens if t in lbl2_tokens]
+        union_tokens = list(dict.fromkeys(lbl1_tokens + lbl2_tokens))  # dedup, keep order
+
+        inter_cuis_set = {
+            cui
+            for tok in inter_tokens
+            for cui in label_dict.get(tok, set())
+        }
+        union_cuis_set = {
+            cui
+            for tok in union_tokens
+            for cui in label_dict.get(tok, set())
+        }
+
+        score1    = jaccard_label(cui_present, cuis1_set)
+        score2    = jaccard_label(cui_present, cuis2_set)
+        score_int = jaccard_label(cui_present, inter_cuis_set) if inter_tokens else -1
+        score_uni = jaccard_label(cui_present, union_cuis_set)
+
+        best_key, _ = max(
+            [
+                ("label1",       score1),
+                ("label2",       score2),
+                ("intersection", score_int),
+                ("union",        score_uni),
+            ],
+            key=lambda x: x[1]
+        )
+
+        if best_key == "label1":
+            label1_ctr += 1
+            ret_labels.append(lbl1_str)
+
+        elif best_key == "label2":
+            label2_ctr += 1
+            ret_labels.append(lbl2_str)
+
+        elif best_key == "intersection":
+            inter_ctr += 1
+            ret_labels.append('|'.join(inter_tokens))
+
+        else:  # union
+            union_ctr += 1
+            ret_labels.append('|'.join(union_tokens))
+
+    print(f"Label 1:       {label1_ctr}")
+    print(f"Label 2:       {label2_ctr}")
+    print(f"Intersection:  {inter_ctr}")
+    print(f"Union:         {union_ctr}")
+
+    return ret_labels
+
+
+def _labels_to_cuis(label_strings, label_dict):
+    union_sets = []
+    for s in label_strings:
+        cuis = set()
+        for lab in filter(None, s.split("|")):
+            cuis |= label_dict[lab]
+        union_sets.append(cuis)
+    return union_sets
+
+
+def binary_macro(report_cuis, label_cui_sets):
+    """
+    1 if *any* CUI in the label hits the report, else 0;
+    then average across labels.
+    """
+    if not label_cui_sets:
+        return 0.0
+    hits = sum(bool(report_cuis & label_cuis) for label_cuis in label_cui_sets)
+    return hits / len(label_cui_sets)
+
+
+def populate_labels(mentions, linker: ClinicalEntityLinker):
+    label_dict = LABEL_TO_CUI.copy()
+    mapping = {"Pleural Effusion": "Effusion",
+               "Lung Opacity": "Opacity",}
+    for mentions_per_text in mentions:
+        for mention in mentions_per_text:
+            if linker.cui2sty[mention.cui_surface] == "T074":
+                label_dict["Support Devices"].add(mention.cui_surface)
+            if  linker.cui2sty[mention.cui_text] == "T074":
+                label_dict["Support Devices"].add(mention.cui_text)
+
+            for label in label_dict:
+                label_name = mapping.get(label) or label
+                label_name = label_name.lower()
+                #label_name = label
+                if label_name in linker.cui2str[mention.cui_surface].lower():
+                    label_dict[label].add(mention.cui_surface)
+                if label_name in linker.cui2str[mention.cui_text].lower():
+                    label_dict[label].add(mention.cui_text)
+
+    for label in label_dict:
+        label_str = f""
+        for cui in label_dict[label]:
+            label_str += f" {linker.cui2str.get(cui, '')} "
+        print(f"{label}: {label_str}")
+
+
+
+
+
+    return label_dict
+
 
 
 

@@ -1,11 +1,8 @@
 import argparse
-import sys
 from pathlib import Path
-from typing import Dict, Tuple, Union, List
-import random
-import matplotlib.pyplot as plt
-
-import faiss
+import io
+from typing import Union, List
+import contextlib
 import numpy as np
 import pandas as pd
 import yaml
@@ -39,7 +36,7 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
     print(f"Anomalies: {anomalies}")
     if config["retrieval_args"]["cost_function"] != "cosine_similarity":
         linker = ClinicalEntityLinker.from_default_constants()
-    reports = []
+    reports = {anomaly: [] for anomaly in anomalies}
     df_unbalanced = pd.read_csv(unbalanced_path)
     df_retrieval = pd.read_csv(retrieval_path)
     df_balanced = pd.read_csv(balanced_path)
@@ -134,16 +131,18 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
                                         model,
                                         config["hyperparameters"]["max_length"],
                                         batch_size, "cuda")
-                scores, indices = knn(index, query_vec, config["hyperparameters"]["k"])
+
+                with contextlib.redirect_stdout(io.StringIO()):
+                    scores, indices = knn(index, query_vec, config["hyperparameters"]["k"])
                 indices = [index for inner_indices in indices for index in inner_indices]
                 indices = np.asarray(indices)
                 index.remove_ids(indices)
                 add_data.append((anom, df_retrieval[image_path_column].iloc[indices]))
-                reports.append((indices[0], df_retrieval[report_column].iloc[indices].values[0]))
-                acc = get_accuracy(df_retrieval, [r[0] for r in reports], anom)
+                reports[anom].append((indices[0], df_retrieval[report_column].iloc[indices].values[0]))
+                acc = get_accuracy(df_retrieval, [r[0] for r in reports[anom]], anom)
                 acc_list[anom].append(acc)
-                sys.stdout.write("\rAnomaly %s Accuracy %f Length %i" % (anom, acc, len(reports)))
-                sys.stdout.flush()
+                print(f"{acc} : {anom} : {len(acc_list[anom])}")
+
             else:
                 mapped_reports = []
                 mapped_neg_reports = []
@@ -187,12 +186,11 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
                 for target_idx in target_indices:
                     indices = mapped_indices[unbalanced_data["ids"][target_idx]]
                     add_data.append((anom, df_retrieval[image_path_column].iloc[indices]))
-                    reports.append((indices[0], df_retrieval[report_column].iloc[indices].values[0]))
+                    reports[anom].append((indices[0], df_retrieval[report_column].iloc[indices].values[0]))
                     #print(reports[-1])
-                    acc = get_accuracy(df_retrieval, [report[0] for report in reports], anom)
+                    acc = get_accuracy(df_retrieval, [report[0] for report in reports[anom]], anom)
                     acc_list[anom].append(acc)
-                    sys.stdout.write("\rAnomaly %s Accuracy %f Length %i" % (anom, acc, len(reports)))
-                    sys.stdout.flush()
+                    print(f"{acc} : {anom} : {len(acc_list[anom])}")
                     used_ids = {df_retrieval.iloc[i][id_column] for i in indices}
                     for report in list(wrapper.set_to_id):  # snapshot of keys
                         ids = wrapper.set_to_id[report]
@@ -248,7 +246,7 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
     df_acc = pd.DataFrame({anom: pd.Series(vals)
                            for anom, vals in acc_list.items()})
     df_acc.to_csv(
-        f"{config['output_dir']}acc_list_{anomalies_stem}.csv",
+        f"{config['output_dir']}acc_list_{stem}.csv",
         index=False
     )
 
@@ -283,9 +281,9 @@ if __name__ == "__main__":
     else:
         config_path = f"/vol/ideadata/ce90tate/knowledge_graph_distance/configs/config.yml"
 
-    df_filled = fill_low_tail_classes(f"/vol/ideadata/ce90tate/knowledge_graph_distance/splits/longtail_8_train_unbalanced_Atelectasis.csv",
-                          f"/vol/ideadata/ce90tate/knowledge_graph_distance/splits/longtail_8_balanced_retrieve.csv",
-                                      "/vol/ideadata/ce90tate/knowledge_graph_distance/splits/longtail_8_balanced_train.csv",
+    df_filled = fill_low_tail_classes(f"/vol/ideadata/ed52egek/pycharm/longtail/data/mimic/longtail_8_unbalanced_all.csv",
+                          f"/vol/ideadata/ed52egek/pycharm/longtail/data/mimic/longtail_8_balanced_retrieve.csv",
+                                      "/vol/ideadata/ed52egek/pycharm/longtail/data/mimic/longtail_8_balanced_train.csv",
                           config_path, anomalies=anomalies)
 
 

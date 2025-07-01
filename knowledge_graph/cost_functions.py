@@ -1,8 +1,6 @@
 from collections import defaultdict
-from typing import List, Set, Dict, Tuple, Union, Sequence, Iterable
+from typing import List, Set, Dict, Tuple, Union
 import math
-import numpy as np
-from sympy.physics.vector.tests.test_printing import alpha
 
 from knowledge_graph.ic_metrics import resnik_bma, _mean_ic
 from knowledge_graph.ner import ClinicalEntityLinker
@@ -272,14 +270,14 @@ def add_synonyms(reference_cuis: set[str],
 
 # jaccard distance
 
-def jaccard_distance(target, valid_refs, set_to_ids):
+def jaccard_distance(target, valid_refs):
     scored = []
     for ref_cuis in valid_refs:
         sim = len(ref_cuis & target) / len(ref_cuis | target) if (ref_cuis | target) else 0
         cost = 1 - sim
-        for ref_id in set_to_ids[ref_cuis]:
-            scored.append((ref_id, ref_cuis, cost))
-    return scored
+        scored.append((ref_cuis, cost))
+    result = max(scored, key=lambda x: x[1])[0]
+    return result
 
 
 
@@ -311,11 +309,6 @@ def overlap_distance(target, valid_refs, set_to_ids):
 def depth_weighted_distance(
     target, valid_refs, depth_sets, max_depth, set_to_ids, *, gamma=1.0
 ):
-    """
-    depth_sets[d]  = CUIs discovered exactly at distance d from *target* in BFS.
-    Weight for depth d:  w_d = exp(‑γ·d).  Larger γ => faster decay.
-    Distance  = 1 / (1 + sim)   (so more overlap at close depths → smaller cost)
-    """
     weights = [math.exp(-gamma * d) for d in range(max_depth + 1)]
     scored = []
     for ref_cuis in valid_refs:
@@ -455,14 +448,6 @@ def weight_by_relation_v2(
     depth_of:        dict[int, int],
     unreachable_cost: int = 5,
 ) -> float:
-    """
-    Like v2, but makes CHD (child-of) edges cheaper.
-
-    • Synonyms (‘SY’, ‘RQ’) still cost 0.
-    • ‘CHD’ costs 0.5 per edge.
-    • All other non-synonym relations (PAR, RB, RN, …) cost 1.
-    • CuIs that are missing or unreachable add `unreachable_cost`.
-    """
     if not reference_cuis:
         return 0.0
 
@@ -510,5 +495,3 @@ def weight_by_relation_v2(
         total += cost
 
     return total
-
-
