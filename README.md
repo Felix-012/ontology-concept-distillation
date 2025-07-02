@@ -25,15 +25,7 @@ conda activate <envname>
 
 ## Configuration
 
-Open `configs/config.yml` and replace the placeholder paths:
-
-```yaml
-paths:
-  mimic_cxr_jpg: /data/mimic-cxr-jpg
-  umls_root: /data/umls
-  mentions: /data/mentions.pkl
-  output_dir: /data/outputs
-```
+Open `configs/config.yml` and replace the placeholder paths.
 
 ## Tasks
 
