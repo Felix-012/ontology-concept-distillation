@@ -1,3 +1,8 @@
+from __future__ import annotations
+
+from collections import defaultdict
+from typing import Set, FrozenSet, Dict, List
+
 import cudf
 import cugraph
 import cupy as cp
@@ -88,23 +93,108 @@ def _intrinsic_ic(G: cugraph.Graph):
     return ic
 
 
-def _ancestors(graph, handle, vertex):
-    bfs_df = bfs(handle, graph, cudf.Series(vertex), False, -1, False, False)
-    mask = bfs_df[0] < cp.iinfo(bfs_df[0].dtype).max
-    ancestors = bfs_df[2][mask]
-    return frozenset(ancestors.get())
+# Global cache: graph_id → {child: [parent, …]}
+_parent_index_cache: Dict[int, Dict[int, List[int]]] = {}
 
-def _resnik(graph, handle, cui1, cui2, ic_map):
-    anc1, anc2 = _ancestors(graph, handle, cui1), _ancestors(graph, handle, cui2)
-    common = anc1 & anc2
+
+def _build_parent_index(graph: cugraph.Graph) -> Dict[int, List[int]]:
+    """Return a mapping *child → [parent, …]* built from the edges of *graph*.
+
+    Expects each edge to point **child → parent**.  If your graph stores the
+    opposite direction, call ``graph.reverse(copy=False)`` first or adapt this
+    function.
+    """
+    df = graph.view_edge_list()
+    src_h = df['src'].values_host
+    dst_h = df['dst'].values_host
+
+    out: Dict[int, List[int]] = defaultdict(list)
+    for child, parent in zip(src_h, dst_h):
+        out[int(child)].append(int(parent))
+    return out
+
+
+def _ancestors(cui: int, parent_index: Dict[int, List[int]]) -> FrozenSet[int]:
+    """Inclusive ancestor set of *cui*."""
+    visited: Set[int] = set()
+    stack: List[int] = [cui]
+    while stack:
+        v = stack.pop()
+        for p in parent_index.get(v, ()):
+            if p not in visited:
+                visited.add(p)
+                stack.append(p)
+    visited.add(cui)
+    return frozenset(visited)
+
+
+def _mica_ic(
+    ic_map: cp.ndarray,
+    anc_a: FrozenSet[int],
+    anc_b: FrozenSet[int],
+) -> float:
+    """Information content of the most informative common ancestor (MICA)."""
+    common = anc_a & anc_b
     if not common:
         return 0.0
-    return max(ic_map[n] for n in common)
+    idx = cp.asarray(list(common))
+    return float(ic_map[idx].max())
 
-def resnik_bma(graph, handle, setA, setB, ic_map):
-    scores_row = [max(_resnik(graph, handle, a, b, ic_map) for b in setB) for a in setA]
-    scores_col = [max(_resnik(graph, handle, b, a, ic_map) for a in setA) for b in setB]
-    return 0.5 * (sum(scores_row) / len(setA) + sum(scores_col) / len(setB))
+def resnik_bma(
+    graph: cugraph.Graph,
+    setA: Set[int],
+    setB: Set[int],
+    ic_map: cp.ndarray,
+    *,
+    graph_key: int  = None,
+) -> float:
+    """Compute Resnik Best-Match Average (BMA) without BFS.
+
+    Parameters
+    ----------
+    graph
+        cuGraph **directed** ontology graph (*child → parent*).
+    setA, setB
+        Sets of integer concept ids (e.g. CUIs).
+    ic_map
+        Dense CuPy array mapping concept id → information content.
+    graph_key
+        Stable id for *graph*.  Defaults to ``id(graph)``; supply your own if
+        you rebuild the graph object frequently but the topology is unchanged.
+    """
+    if not setA or not setB:
+        return 0.0
+
+    key = graph_key if graph_key is not None else id(graph)
+    if key not in _parent_index_cache:
+        _parent_index_cache[key] = _build_parent_index(graph)
+    parent_index = _parent_index_cache[key]
+
+    # Per-call cache avoids repeated global LRU look-ups inside the hot loop
+    anc_cache: Dict[int, FrozenSet[int]] = {}
+
+    def ancestors(cui: int) -> FrozenSet[int]:
+        if cui in anc_cache:
+            return anc_cache[cui]
+        fs = _ancestors(cui, parent_index)
+        anc_cache[cui] = fs
+        return fs
+
+    def best_match(row: List[int], col: List[int]) -> cp.ndarray:
+        bm = cp.empty(len(row), dtype=cp.float32)
+        anc_col = [ancestors(b) for b in col]  # pre-gather
+        for i, a in enumerate(row):
+            anc_a = ancestors(a)
+            scores = cp.asarray(
+                [_mica_ic(ic_map, anc_a, anc_b) for anc_b in anc_col],
+                dtype=cp.float32,
+            )
+            bm[i] = scores.max() if scores.size else 0.0
+        return bm
+
+    scores_row = best_match(list(setA), list(setB))
+    scores_col = best_match(list(setB), list(setA))
+    return float(0.5 * (scores_row.mean() + scores_col.mean()))
 
 def bfs_level_dag(
     G: cugraph.Graph,
@@ -149,35 +239,39 @@ def bfs_level_dag(
 
     return G_dag, old_to_new, new_to_old
 
-def construct_ic_graph_wrapper(mrrel_path, keep_cuis, max_expl_depth) -> ICGraphWrapper:
-    HIER_REL = ["PAR", "CHD", "RN", "RB", ]
-    cols = ["CUI1","AUI1","STYPE1","REL","CUI2","AUI2","STYPE2",
-            "RELA","RUI","SRUI","SAB","SL","RG","DIR","SUPPRESS","CVF"]
-    mrrel = cudf.read_csv(mrrel_path,
-                          sep="|",
-                          names=cols,
-                          usecols=["CUI1", "REL", "CUI2", "SAB"],
-                          dtype={"CUI1": "str", "CUI2": "str", "REL": "str", "SAB": "str"})
+def construct_ic_graph_wrapper(mrhier_path, keep_cuis, max_expl_depth) -> ICGraphWrapper:
+    COLS = ["CUI", "AUI", "CXN", "PAUI", "SAB", "RELA",
+            "PTR", "HCD", "HXD", "HSG"]
+    mrhier = cudf.read_csv(
+        mrhier_path,
+        sep="|",
+        names=COLS,
+        usecols=["CUI", "AUI", "PAUI", "SAB"],
+        dtype={"CUI": "str", "AUI": "str", "PAUI": "str", "SAB": "str"}
+    ).to_pandas()
 
-    mrrel = mrrel.to_pandas()
+        # map AUI → CUI (needed to obtain the parent's CUI from PAUI)
+    aui_to_cui = (
+        mrhier[["AUI", "CUI"]]
+        .drop_duplicates(subset="AUI", keep="first")
+        .set_index("AUI")["CUI"]
+    )
 
-    mrrel = mrrel[mrrel.REL.isin(HIER_REL)]
-    mrrel = mrrel[mrrel["CUI1"] != mrrel["CUI2"]]
+    # merge to get parent CUI; rows with unknown PAUI are dropped
+    mrhier["parent"] = mrhier["PAUI"].map(aui_to_cui)
+    mrhier = mrhier.dropna(subset=["parent"])
 
-    mrrel["child"] = mrrel["CUI1"]
-    mrrel["parent"] = mrrel["CUI2"]
+    # child / parent (exclude self-loops for now)
+    mrhier = mrhier[mrhier["CUI"] != mrhier["parent"]]
+    mrhier["child"] = mrhier["CUI"]
 
-    mask_second_is_child = mrrel["REL"].isin(["CHD", "RB"])
-    mrrel.loc[mask_second_is_child, ["child", "parent"]] = mrrel.loc[mask_second_is_child, ["CUI2", "CUI1"]].values
 
-    mrrel = cudf.from_pandas(mrrel)
+    edges = cudf.from_pandas(
+        mrhier[["child", "parent"]].rename(columns={"child": "src", "parent": "dst"})
+    )
 
-    edges = mrrel[["child", "parent"]].rename(columns={"child": "src", "parent": "dst"})
-
-    id_map = cudf.DataFrame({
-        "CUI": cudf.concat([edges["src"], edges["dst"]]).unique()
-    })
-    id_map["vid"] = cp.arange(len(id_map), dtype="int32")  # contiguous 0 … N-1
+    id_map = cudf.DataFrame({"CUI": cudf.concat([edges["src"], edges["dst"]]).unique()})
+    id_map["vid"] = cp.arange(len(id_map), dtype="int32")
 
     new_vids = None
     if keep_cuis is not None:
@@ -190,7 +284,7 @@ def construct_ic_graph_wrapper(mrrel_path, keep_cuis, max_expl_depth) -> ICGraph
             id_map = cudf.concat([id_map, new_id_map], ignore_index=True)
 
     cui_to_vid = dict(zip(id_map["CUI"].values_host, id_map["vid"].values_host))
-    vid_to_cui = dict(zip(id_map["vid"].values_host, id_map["CUI"].values_host))
+    vid_to_cui = {v: k for k, v in cui_to_vid.items()}
 
     edges = edges.assign(
         src=edges["src"].map(cui_to_vid),
@@ -198,46 +292,25 @@ def construct_ic_graph_wrapper(mrrel_path, keep_cuis, max_expl_depth) -> ICGraph
     )
 
     if new_vids is not None and len(new_vids) > 0:
-        # create a self‐loop for every missing vid
-        isolated_vertices = cudf.DataFrame({
-            "src": new_vids,
-            "dst": new_vids
-        })
-        # tack them onto your real edges
-        edges = cudf.concat([edges, isolated_vertices], ignore_index=True)
+        isolated = cudf.DataFrame({"src": new_vids, "dst": new_vids})
+        edges = cudf.concat([edges, isolated], ignore_index=True)
+    G = cugraph.Graph(directed=True)
+    G.from_cudf_edgelist(edges, source="src", destination="dst", renumber=False)
 
-    G = cugraph.Graph(directed=True)  # directed = True by default
-    G.from_cudf_edgelist(edges,
-                         source="src",
-                         destination="dst",
-                         renumber=False)
+    keep_vids = {cui_to_vid[cui] for cui in keep_cuis if cui in cui_to_vid}
 
-    keep_cuis = {cui_to_vid[cui] for cui in keep_cuis if cui in cui_to_vid.keys()}
 
-    G_ic, old_to_new, new_to_old = bfs_level_dag(G, keep_cuis, max_expl_depth)
-    cui_to_vid = {cui: old_to_new[old_vid] for cui, old_vid in cui_to_vid.items() if old_vid in old_to_new.keys()}
-    vid_to_cui = {new_vid: vid_to_cui[old_vid] for new_vid, old_vid in new_to_old.items() if
-                  old_vid in vid_to_cui.keys()}
-    ic_scores = _intrinsic_ic(G_ic)
+    ic_scores = _intrinsic_ic(G)
 
-    sg, handle = knowledge_graph.graph_utils.construct_gpu_graph(G_ic)
+    return ICGraphWrapper(G, None, ic_scores,
+                          cui_to_vid=cui_to_vid,
+                          vid_to_cui=vid_to_cui)
 
-    return ICGraphWrapper(sg, handle, ic_scores, cui_to_vid=cui_to_vid, vid_to_cui=vid_to_cui)
 
 
 def _mean_ic(concepts, ic_scores):
     return sum(ic_scores[c] for c in concepts) / len(concepts)
 
-
-'''
-data = initialize_data(csv_path="/vol/ideadata/ce90tate/knowledge_graph_distance/splits/longtail_balanced_train.csv",
-                       image_base_path="vol/ideadata/ed52egek/data/mimic/jpg/physionet.org/files/mimic-cxr-jpg/2.0.0/",
-                       split_value=None,
-                       split_column="split",
-                       report_column="impression",
-                       id_column="dicom_id",
-                       image_path_column="path")
-'''
 
 
 
