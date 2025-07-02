@@ -1,7 +1,7 @@
 import os
 from itertools import repeat
 
-from knowledge_graph.cost_functions import dist, ic_dist, apply_filter
+from knowledge_graph.cost_functions import dist, ic_dist
 from knowledge_graph.graph import build_graph, GraphWrapper
 
 import random
@@ -98,14 +98,12 @@ def k_closest_reference_reports(
 
         depth_sets: list[set[str]] = []  # CUIs newly discovered at depth d
         if vids:
-            # Run the BFS as before
             distances, predecessors, vertices = _bfs_depth(
                 handle, sg, cudf.Series(list(vids)), depth=max_depth
             )
 
-            # ── 1.  Build handy NumPy views for fast look-ups ────────────────────────────────
-            vert_np = cupy.asnumpy(vertices)  # vertex-id order returned by cugraph
-            pred_np = cupy.asnumpy(predecessors)  # predecessor of each vertex (‒1 for roots)
+            vert_np = cupy.asnumpy(vertices)
+            pred_np = cupy.asnumpy(predecessors)
             dist_np = cupy.asnumpy(distances)
             dist_np[dist_np >= cupy.iinfo(dist_np.dtype).max] = -1
             graph_wrapper.depth_of = dict(zip(vert_np, dist_np))
@@ -122,22 +120,6 @@ def k_closest_reference_reports(
             for d in range(1, max_depth + 1):
                 vids_at_d = cupy.asnumpy(vertices[distances == d])
                 neg_depth_sets.append({vid_to_cui[v] for v in vids_at_d})
-
-        '''
-        dist_from_t = {}
-        for t_cui in target:
-            t_vid = cui_to_vid[t_cui]
-            d, p, v = _bfs_depth(handle, sg, cudf.Series([t_vid]), depth=max_depth)
-
-            dist_from_t[t_cui] = {
-                int(vv): int(dd)
-                for vv, dd in zip(cupy.asnumpy(v), cupy.asnumpy(d))
-                if 0 < dd <= max_depth  # skip the source itself
-            }
-        '''
-
-
-            
 
 
         if not target:
@@ -293,7 +275,7 @@ def preprocess_mentions(mentions: List[List[Mention]]) \
             m.cui_text
             for m in mentions_per_text
             if type(m.cui_text) == str and m.assertion != "absent"
-               and (has_observation or not m.category.startswith("Anatomy"))  # ← drop anatomy if no OBS
+               and (has_observation or not m.category.startswith("Anatomy"))
         }
 
         cuis_set = frozenset(cuis_set | cuis_set_text)

@@ -15,6 +15,17 @@ from knowledge_graph.ic_metrics import construct_ic_graph_wrapper
 from knowledge_graph.ner import get_mentions, ClinicalEntityLinker
 from knowledge_graph.similarity_search import load_index, embed_texts, build_index, save_index, knn
 
+ANOMALIES = [
+    "Atelectasis",
+    "Cardiomegaly",
+    "Consolidation",
+    "Edema",
+    "No Finding",
+    "Pleural Effusion",
+    "Pneumonia",
+    "Pneumothorax",
+]
+
 
 def fill_low_tail_classes(unbalanced_path: Union[str, Path],
                           retrieval_path: Union[str, Path],
@@ -35,7 +46,7 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
     print(f"beta: {config['hyperparameters']['beta']}")
     print(f"Anomalies: {anomalies}")
     if config["retrieval_args"]["cost_function"] != "cosine_similarity":
-        linker = ClinicalEntityLinker.from_default_constants()
+        linker = ClinicalEntityLinker.from_config_path(args.config)
     reports = {anomaly: [] for anomaly in anomalies}
     df_unbalanced = pd.read_csv(unbalanced_path)
     df_retrieval = pd.read_csv(retrieval_path)
@@ -266,26 +277,53 @@ def get_accuracy(df, indices, label):
     return hits/len(indices)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    #parser.add_argument("unbalanced_path", type=str, default=None)
-    #parser.add_argument("retrieval_path", type=str, default=None)
-    parser.add_argument("--config_path", type=str, default=None)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Augment an unbalanced split with retrieved examples "
+                    "to obtain a better class distribution."
+    )
+    parser.add_argument("--unbalanced_csv", required=True,
+                        help="Path to the original unbalanced CSV split.")
+    parser.add_argument("--retrieval_csv", required=True,
+                        help="Path to the retrieval set with candidate rows.")
+    parser.add_argument("--train_csv", required=True,
+                        help="Path to the balanced-train CSV (input baseline).")
+    parser.add_argument("--config_path",
+                        help="YAML config file for data initialisation.")
+    parser.add_argument("--output", default=None,
+                        help="Destination for the filled CSV. "
+                             "If omitted, *_filled.csv is created next to --train_csv.")
     return parser.parse_args()
 
-if __name__ == "__main__":
-    anomalies = ["Atelectasis", "Cardiomegaly", "Consolidation", "Edema", "No Finding", "Pleural Effusion", "Pneumonia", "Pneumothorax"]
+
+
+def main() -> None:
     args = parse_args()
-    if args.config_path is not None:
-        config_path = args.config_path
-    else:
-        config_path = f"/vol/ideadata/ce90tate/knowledge_graph_distance/configs/config.yml"
 
-    df_filled = fill_low_tail_classes(f"/vol/ideadata/ed52egek/pycharm/longtail/data/mimic/longtail_8_unbalanced_all.csv",
-                          f"/vol/ideadata/ed52egek/pycharm/longtail/data/mimic/longtail_8_balanced_retrieve.csv",
-                                      "/vol/ideadata/ed52egek/pycharm/longtail/data/mimic/longtail_8_balanced_train.csv",
-                          config_path, anomalies=anomalies)
+    df_filled = fill_low_tail_classes(
+        args.unbalanced_csv,
+        args.retrieval_csv,
+        args.train_csv,
+        args.config_path,
+        anomalies=ANOMALIES,
+    )
 
+    # Resolve target path
+    out_path = (
+        Path(args.output)
+        if args.output
+        else Path(args.train_csv).with_name(
+            f"{Path(args.train_csv).stem}_filled.csv"
+        )
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    df_filled.to_csv(out_path, index=False)
+    print(f"✔︎ Saved filled CSV to {out_path}")
+
+
+if __name__ == "__main__":
+    main()
 
 
 

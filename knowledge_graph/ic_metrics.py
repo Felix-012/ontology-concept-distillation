@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import functools
 from collections import defaultdict
 from typing import Set, FrozenSet, Dict, List
 
 import cudf
 import cugraph
 import cupy as cp
-import pylibcugraph
-from pylibcugraph import bfs, ResourceHandle
+from pylibcugraph import bfs
 
 import knowledge_graph.graph_utils
 
@@ -95,10 +93,6 @@ def _intrinsic_ic(G: cugraph.Graph):
     return ic
 
 
-###############################################################################
-# Ancestor helpers
-###############################################################################
-
 # Global cache: graph_id → {child: [parent, …]}
 _parent_index_cache: Dict[int, Dict[int, List[int]]] = {}
 
@@ -134,10 +128,6 @@ def _ancestors(cui: int, parent_index: Dict[int, List[int]]) -> FrozenSet[int]:
     return frozenset(visited)
 
 
-###############################################################################
-# Resnik helpers
-###############################################################################
-
 def _mica_ic(
     ic_map: cp.ndarray,
     anc_a: FrozenSet[int],
@@ -149,11 +139,6 @@ def _mica_ic(
         return 0.0
     idx = cp.asarray(list(common))
     return float(ic_map[idx].max())
-
-
-###############################################################################
-# Public API
-###############################################################################
 
 def resnik_bma(
     graph: cugraph.Graph,
@@ -255,29 +240,6 @@ def bfs_level_dag(
     return G_dag, old_to_new, new_to_old
 
 def construct_ic_graph_wrapper(mrhier_path, keep_cuis, max_expl_depth) -> ICGraphWrapper:
-    """
-    Build an IC-weighted GPU graph from the UMLS MRHIER table
-    (instead of the pruned MRREL table used previously).
-
-    Parameters
-    ----------
-    mrhier_path : str
-        Path to `MRHIER.RRF` (pipe-delimited, *no* header row).
-    keep_cuis : Collection[str] | None
-        CUIs that **must** appear in the final graph (isolated self-loops
-        are added if a CUI has no hierarchical neighbours).
-    max_expl_depth : int
-        Maximum BFS depth to explore from each `keep_cui`.
-
-    Returns
-    -------
-    ICGraphWrapper
-        Wrapper with the sub-DAG, RAPIDS handle, intrinsic-IC scores
-        and CUI ↔ vertex-id maps.
-    """
-    # ------------------------------------------------------------------
-    # 1.  Read MRHIER and extract child-parent CUI pairs
-    # ------------------------------------------------------------------
     COLS = ["CUI", "AUI", "CXN", "PAUI", "SAB", "RELA",
             "PTR", "HCD", "HXD", "HSG"]
     mrhier = cudf.read_csv(
@@ -304,17 +266,10 @@ def construct_ic_graph_wrapper(mrhier_path, keep_cuis, max_expl_depth) -> ICGrap
     mrhier["child"] = mrhier["CUI"]
 
 
-
-    # ------------------------------------------------------------------
-    # 2.  Convert to cuDF and build an edge list
-    # ------------------------------------------------------------------
     edges = cudf.from_pandas(
         mrhier[["child", "parent"]].rename(columns={"child": "src", "parent": "dst"})
     )
 
-    # ------------------------------------------------------------------
-    # 3.  Create contiguous vertex ids
-    # ------------------------------------------------------------------
     id_map = cudf.DataFrame({"CUI": cudf.concat([edges["src"], edges["dst"]]).unique()})
     id_map["vid"] = cp.arange(len(id_map), dtype="int32")
 
@@ -336,29 +291,16 @@ def construct_ic_graph_wrapper(mrhier_path, keep_cuis, max_expl_depth) -> ICGrap
         dst=edges["dst"].map(cui_to_vid)
     )
 
-    # add isolated self-loops for keep_cuis that had no neighbours
     if new_vids is not None and len(new_vids) > 0:
         isolated = cudf.DataFrame({"src": new_vids, "dst": new_vids})
         edges = cudf.concat([edges, isolated], ignore_index=True)
-
-    # ------------------------------------------------------------------
-    # 4.  Build the GPU graph
-    # ------------------------------------------------------------------
     G = cugraph.Graph(directed=True)
     G.from_cudf_edgelist(edges, source="src", destination="dst", renumber=False)
 
     keep_vids = {cui_to_vid[cui] for cui in keep_cuis if cui in cui_to_vid}
 
-    # ------------------------------------------------------------------
-    # 5.  Extract the BFS-level DAG around the keep CUIs and compute IC
-    # ------------------------------------------------------------------
-    #G_ic, old_to_new, new_to_old = bfs_level_dag(G, keep_vids, max_expl_depth)
-    #cui_to_vid = {cui: old_to_new[vid] for cui, vid in cui_to_vid.items() if vid in old_to_new}
-    #vid_to_cui = {new_vid: vid_to_cui[old_vid] for new_vid, old_vid in new_to_old.items()}
 
     ic_scores = _intrinsic_ic(G)
-
-    #sg, handle = knowledge_graph.graph_utils.construct_gpu_graph(G)
 
     return ICGraphWrapper(G, None, ic_scores,
                           cui_to_vid=cui_to_vid,
@@ -369,16 +311,6 @@ def construct_ic_graph_wrapper(mrhier_path, keep_cuis, max_expl_depth) -> ICGrap
 def _mean_ic(concepts, ic_scores):
     return sum(ic_scores[c] for c in concepts) / len(concepts)
 
-
-'''
-data = initialize_data(csv_path="/vol/ideadata/ce90tate/knowledge_graph_distance/splits/longtail_balanced_train.csv",
-                       image_base_path="vol/ideadata/ed52egek/data/mimic/jpg/physionet.org/files/mimic-cxr-jpg/2.0.0/",
-                       split_value=None,
-                       split_column="split",
-                       report_column="impression",
-                       id_column="dicom_id",
-                       image_path_column="path")
-'''
 
 
 
