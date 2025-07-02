@@ -51,6 +51,7 @@ python label_csv.py \
   --src            ./splits/longtail_8_balanced_train.csv \
   --dst            /path/to/prelim_labels.csv \
   --mentions_path  /path/to/mentions.pkl
+  --config_path    ./configs/config.yml
 ```
 
 #### Stage 2 – Final Labels
