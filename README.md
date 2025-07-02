@@ -5,12 +5,13 @@
 * **PhysioNet credentialed account** to download the [MIMIC‑CXR‑JPG v2.1.0](https://physionet.org/content/mimic-cxr-jpg/2.1.0/) dataset.
 * **UMLS license (UTS account)** to access the [UMLS Full Subset](https://www.nlm.nih.gov/research/umls/licensedcontent/umlsknowledgesources.html).
 
-## Dataset Downloads
+## Dataset Downloads and Split Creation
 
-Download and extract the datasets to locations of your choice.
+- Download and extract the datasets to locations of your choice.
+- Create `mimic_metadata_preprocessed.csv` in the form of `./splits/example.csv` based on the MIMIC-CXR-JPG metadata file.
+- Follow the `splitgeneration.ipynb` script to generate the splits and save them in the `splits` directory.
 
 
-> **Tip:** keep paths short and without spaces; you will reference them in the config file.
 
 ## Environment Setup
 
