@@ -46,7 +46,7 @@ def fill_low_tail_classes(unbalanced_path: Union[str, Path],
     print(f"beta: {config['hyperparameters']['beta']}")
     print(f"Anomalies: {anomalies}")
     if config["retrieval_args"]["cost_function"] != "cosine_similarity":
-        linker = ClinicalEntityLinker.from_config_path(args.config)
+        linker = ClinicalEntityLinker.from_config_path(config_path)
     reports = {anomaly: [] for anomaly in anomalies}
     df_unbalanced = pd.read_csv(unbalanced_path)
     df_retrieval = pd.read_csv(retrieval_path)

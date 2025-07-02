@@ -117,8 +117,8 @@ class ClinicalEntityLinker:
                  index_file,
                  dtype=torch.float16,
                  device=DEVICE):
-        self._nlp = spacy.load("en_core_sci_lg")
-        self._nlp.add_pipe("negex")
+
+        self.mapping_file = mapping_file
         self.conso_file = conso_file
         self.index_dir = index_dir
         self.index_file = index_file
@@ -158,8 +158,8 @@ class ClinicalEntityLinker:
         self.cui2str = dict(self.syns.values)
         self.importance_scores_sty = {"T047": 3, "T046": 2, "T033": 1, "T019": 0,  "T037": 0,
                                       "T017": 0, "T023": 0, "T029": 0, "T030": 0, "T082": 0}
-        #self.relations = self._load_mrrel(mrrel_file)
-        self.relations = None
+        self.relations = self._load_mrrel(mrrel_file)
+        #self.relations = None
 
 
     @classmethod
@@ -167,13 +167,13 @@ class ClinicalEntityLinker:
         with open(config_path, "r") as stream:
             config = yaml.safe_load(stream)
         return cls(
-            conso_file=config.mrconso_path,
-            sty_file=config.mrsty_path,
-            mrrel_file=config.mrrel_path,
+            conso_file=config["mrconso_path"],
+            sty_file=config["mrsty_path"],
+            mrrel_file=config["mrrel_path"],
             sapbert_model_id=SAPBERT_MODEL_ID,
-            mapping_file=config.mapping_file,
-            index_dir=config.index_dir,
-            index_file=config.index_file,
+            mapping_file=config["mapping_file"],
+            index_dir=config["index_dir"],
+            index_file=config["index_file"],
             dtype=DTYPE,
             device=DEVICE
         )
@@ -409,7 +409,7 @@ class ClinicalEntityLinker:
         index = faiss.IndexFlatIP(mat.shape[1])
         index.add(mat)
         faiss.write_index(index, str(self.index_file))
-        with open(MAPPING_FILE, "w", encoding="utf‑8") as fp:
+        with open(self.mapping_file, "w", encoding="utf‑8") as fp:
             json.dump({str(k): v for k, v in id2cui.items()}, fp)
         rprint(f"[green]Built FAISS index with {len(mat):,} vectors.[/green]")
 

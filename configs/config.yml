@@ -1,24 +1,24 @@
-output_dir: "/vol/ideadata/ce90tate/knowledge_graph_distance/retrieved_final/"
+output_dir: "<insert>" # output directory for your retrieval csvs
 output_suffix: "all_anomalies"
-mentions_path: "/vol/ideadata/ce90tate/data/umls/mentions_mimic_lt_train_retrieval_top128_all_diseases.pkl"
-retrieval_mentions_path: "/vol/ideadata/ce90tate/data/umls/mentions_8_balanced_retrieve_retrieval_top128_all_diseases.pkl"
-mrrel_path: "/vol/ideadata/ce90tate/data/umls/2024AB/META/MRREL.RRF"
-mrhier_path: "/vol/ideadata/ce90tate/data/umls/2024AB/META/MRHIER.RRF"
-mrconso_path: "/vol/ideadata/ce90tate/data/umls/2024AB/META/MRCONSO.RRF"
-mrsty_path: "/vol/ideadata/ce90tate/data/umls/2024AB/META/MRSTY.RRF"
-index_dir: "/vol/ideadata/ce90tate/data/faiss/sapbert_umls_index_t046"
-index_file: "/vol/ideadata/ce90tate/data/faiss/sapbert_umls_index_t046/sapbert.index"
-mapping_file: "/vol/ideadata/ce90tate/data/faiss/sapbert_umls_index_t046/sapbert_id2cui.json"
+mentions_path: "<insert>.pkl" # should point to the precomputed mentions of the train retrieval reports
+retrieval_mentions_path: "<insert>.pkl" # should point to the precomputed mentions of the retrieval reports
+mrrel_path: "<path/to>/MRREL.RRF"
+mrhier_path: "<path/to>/MRHIER.RRF"
+mrconso_path: "<path/to>/MRCONSO.RRF"
+mrsty_path: "<path/to>/MRSTY.RRF"
+index_dir: "<insert>" # location of your SapBERT FAISS index
+index_file: "<index_dir>/sapbert.index"
+mapping_file: "<index_dir>/sapbert_id2cui.json"
 
 init_data_args:
-  image_base_path: "vol/ideadata/ed52egek/data/mimic/jpg/physionet.org/files/mimic-cxr-jpg/2.0.0/"
+  image_base_path: "<insert>" # Main Folder of your MIMIC-CXR Image Files
   report_column: "impression"
   id_column: "dicom_id"
-  image_path_column: path
+  image_path_column: "path"
 
 retrieval_args:
   use_ic: False
-  cost_function: sym_tversky
+  cost_function: sym_tversky # set to cosine_similarity to use LLMs
 
 hyperparameters:
   k: 1
@@ -33,4 +33,4 @@ cosine_similarity:
   type: cxr-bert
   model: microsoft/BiomedVLP-CXR-BERT-specialized
   subfolder: False
-  index_path: /vol/ideadata/ce90tate/data/faiss/ss/cxr-bert_all_diseases.index
+  index_path: <insert>/cxr-bert_all_diseases.index # path to the LLM FAISS index (see knowledge_graph/similarity_search.py)
