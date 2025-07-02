@@ -74,10 +74,9 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--src", required=True, type=Path, help="Input metadata CSV (one row per study).")
     parser.add_argument("--dst", required=True, type=Path, help="Destination path for the processed CSV.")
-    parser.add_argument("--config-path", required=True, type=Path, help="YAML config consumed by initialize_data.")
-    parser.add_argument("--reference-path", required=True, type=Path, help="CSV mapping dicom_id → path.")
-    parser.add_argument("--mentions-path", required=True, type=Path, help="Cache path for mention extraction.")
-    parser.add_argument("--use-uncertain", action="store_true", help="Treat 'uncertain' as positive when set.")
+    parser.add_argument("--config_path", required=True, type=Path, help="YAML config consumed by initialize_data.")
+    parser.add_argument("--mentions_path", required=True, type=Path, help="Cache path for mention extraction.")
+    parser.add_argument("--use_uncertain", action="store_true", help="Treat 'uncertain' as positive when set.")
 
     return parser.parse_args()
 
@@ -101,8 +100,7 @@ if __name__ == "__main__":
 
     label_df["Finding Labels"] = label_df["Finding Labels"].apply(replace_effusion_token)
 
-    df_reference = pd.read_csv(args.reference_path).drop_duplicates(subset="dicom_id")
-    label_df = label_df.merge(df_reference[["dicom_id", "path"]], on="dicom_id", how="left")
+    label_df = label_df.merge(df_src[["dicom_id", "path"]], on="dicom_id", how="left")
 
     dst_path = args.dst
     dst_path.parent.mkdir(parents=True, exist_ok=True)
